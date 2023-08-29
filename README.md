@@ -227,18 +227,3 @@ instant preview. To achieve these goals, we follow three core design principles:
 [`comemo`]: https://github.com/typst/comemo/
 
 
-# CHECKPOINT
-- https://www.rust-lang.org/learn/get-started
-- https://github.com/okatsn/my-typst-space
-- https://github.com/nvarner/typst-lsp
-
-vscode
-- https://github.com/Enter-tainer/typst-preview
-
-## How to use
-https://typst.app/docs/tutorial/
-https://github.com/ice-kylin/typst-cv-miku
-
-### Reading from
-https://typst.app/docs/tutorial/making-a-template/
-https://typst.app/docs/reference/scripting/
