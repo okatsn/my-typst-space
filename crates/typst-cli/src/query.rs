@@ -1,10 +1,12 @@
 use comemo::Track;
+use ecow::{eco_format, EcoString};
 use serde::Serialize;
 use typst::diag::{bail, StrResult};
 use typst::eval::{eval_string, EvalMode, Tracer};
-use typst::model::Introspector;
+use typst::foundations::{Content, IntoValue, LocatableSelector, Scope};
+use typst::model::Document;
+use typst::syntax::Span;
 use typst::World;
-use typst_library::prelude::*;
 
 use crate::args::{QueryCommand, SerializationFormat};
 use crate::compile::print_diagnostics;
@@ -12,26 +14,25 @@ use crate::set_failed;
 use crate::world::SystemWorld;
 
 /// Execute a query command.
-pub fn query(command: QueryCommand) -> StrResult<()> {
+pub fn query(command: &QueryCommand) -> StrResult<()> {
     let mut world = SystemWorld::new(&command.common)?;
-    tracing::info!("Starting querying");
 
     // Reset everything and ensure that the main file is present.
     world.reset();
     world.source(world.main()).map_err(|err| err.to_string())?;
 
-    let mut tracer = Tracer::default();
+    let mut tracer = Tracer::new();
     let result = typst::compile(&world, &mut tracer);
     let warnings = tracer.warnings();
 
     match result {
         // Retrieve and print query results.
         Ok(document) => {
-            let data = retrieve(&world, &command, &document)?;
-            let serialized = format(data, &command)?;
+            let data = retrieve(&world, command, &document)?;
+            let serialized = format(data, command)?;
             println!("{serialized}");
             print_diagnostics(&world, &[], &warnings, command.common.diagnostic_format)
-                .map_err(|_| "failed to print diagnostics")?;
+                .map_err(|err| eco_format!("failed to print diagnostics ({err})"))?;
         }
 
         // Print diagnostics.
@@ -43,7 +44,7 @@ pub fn query(command: QueryCommand) -> StrResult<()> {
                 &warnings,
                 command.common.diagnostic_format,
             )
-            .map_err(|_| "failed to print diagnostics")?;
+            .map_err(|err| eco_format!("failed to print diagnostics ({err})"))?;
         }
     }
 
@@ -73,29 +74,32 @@ fn retrieve(
     })?
     .cast::<LocatableSelector>()?;
 
-    Ok(Introspector::new(&document.pages)
+    Ok(document
+        .introspector
         .query(&selector.0)
         .into_iter()
-        .map(|x| x.into_inner())
         .collect::<Vec<_>>())
 }
 
 /// Format the query result in the output format.
 fn format(elements: Vec<Content>, command: &QueryCommand) -> StrResult<String> {
     if command.one && elements.len() != 1 {
-        bail!("expected exactly one element, found {}", elements.len())
+        bail!("expected exactly one element, found {}", elements.len());
     }
 
     let mapped: Vec<_> = elements
         .into_iter()
         .filter_map(|c| match &command.field {
-            Some(field) => c.field(field),
+            Some(field) => c.get_by_name(field),
             _ => Some(c.into_value()),
         })
         .collect();
 
     if command.one {
-        serialize(&mapped[0], command.format)
+        let Some(value) = mapped.first() else {
+            bail!("no such field found for element");
+        };
+        serialize(value, command.format)
     } else {
         serialize(&mapped, command.format)
     }

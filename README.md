@@ -4,17 +4,20 @@
 
 <p align="center">
   <a href="https://typst.app/docs/">
-    <img alt="Documentation" src="https://img.shields.io/website?down_message=offline&label=docs&up_color=007aff&up_message=online&url=https%3A%2F%2Ftypst.app%2Fdocs"/>
-  </a>
+    <img alt="Documentation" src="https://img.shields.io/website?down_message=offline&label=docs&up_color=007aff&up_message=online&url=https%3A%2F%2Ftypst.app%2Fdocs"
+  /></a>
   <a href="https://typst.app/">
-    <img alt="Typst App" src="https://img.shields.io/website?down_message=offline&label=typst.app&up_color=239dad&up_message=online&url=https%3A%2F%2Ftypst.app"/>
-  </a>
+    <img alt="Typst App" src="https://img.shields.io/website?down_message=offline&label=typst.app&up_color=239dad&up_message=online&url=https%3A%2F%2Ftypst.app"
+  /></a>
   <a href="https://discord.gg/2uDybryKPe">
-    <img alt="Discord Server" src="https://img.shields.io/discord/1054443721975922748?color=5865F2&label=discord&labelColor=555"/>
-  </a>
+    <img alt="Discord Server" src="https://img.shields.io/discord/1054443721975922748?color=5865F2&label=discord&labelColor=555"
+  /></a>
   <a href="https://github.com/typst/typst/blob/main/LICENSE">
-    <img alt="Apache-2 License" src="https://img.shields.io/badge/license-Apache%202-brightgreen"/>
-  </a>
+    <img alt="Apache-2 License" src="https://img.shields.io/badge/license-Apache%202-brightgreen"
+  /></a>
+  <a href="https://typst.app/jobs/">
+    <img alt="Jobs at Typst" src="https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Ftypst.app%2Fassets%2Fdata%2Fshields.json&query=%24.jobs.text&label=jobs&color=%23A561FF&cacheSeconds=1800"
+  /></a>
 </p>
 
 Typst is a new markup-based typesetting system that is designed to be as powerful
@@ -54,17 +57,17 @@ Let's dissect what's going on:
   markup like this, see the [syntax] reference for a full list.
 
 - [Mathematical equations][math] are enclosed in dollar signs. By adding extra
-  spaces around the contents of a equation, we can put it into a separate block.
+  spaces around the contents of an equation, we can put it into a separate block.
   Multi-letter identifiers are interpreted as Typst definitions and functions
   unless put into quotes. This way, we don't need backslashes for things like
   `floor` and `sqrt`. And `phi.alt` applies the `alt` modifier to the `phi` to
   select a particular symbol variant.
 
 - Now, we get to some [scripting]. To input code into a Typst document, we can
-  write a hashtag followed by an expression. We define two variables and a
+  write a hash followed by an expression. We define two variables and a
   recursive function to compute the n-th fibonacci number. Then, we display the
   results in a center-aligned table. The table function takes its cells
-  row-by-row. Therefore, we first pass the formulas `$F_1$` to `$F_10$` and then
+  row-by-row. Therefore, we first pass the formulas `$F_1$` to `$F_8$` and then
   the computed fibonacci numbers. We apply the spreading operator (`..`) to both
   because they are arrays and we want to pass the arrays' items as individual
   arguments.
@@ -72,7 +75,7 @@ Let's dissect what's going on:
 <details>
   <summary>Text version of the code example.</summary>
 
-  ```text
+  ```typst
   #set page(width: 10cm, height: auto)
   #set heading(numbering: "1.")
 
@@ -105,19 +108,20 @@ Let's dissect what's going on:
 Typst's CLI is available from different sources:
 
 - You can get sources and pre-built binaries for the latest release of Typst
-  from the [releases page][releases].
+  from the [releases page][releases]. Download the archive for your platform and
+  place it in a directory that is in your `PATH`. To stay up to date with future
+  releases, you can simply run `typst update`.
 
 - You can install Typst through different package managers. Note that the
   versions in the package managers might lag behind the latest release.
-  - macOS/Linux: `brew install typst`
-  - Arch Linux: `pacman -S typst`
-  - Void Linux: `xbps-install typst`
-  - Windows Package Manager: `winget install --id Typst.Typst`
+  - Linux: View [Typst on Repology][repology]
+  - macOS: `brew install typst`
+  - Windows: `winget install --id Typst.Typst`
 
 - If you have a [Rust][rust] toolchain installed, you can also install the
   latest development version with
-  `cargo install --git https://github.com/typst/typst`. Note that this will
-  be a "nightly" version that may be broken or not yet properly documented.
+  `cargo install --git https://github.com/typst/typst --locked typst-cli`. Note that this
+  will be a "nightly" version that may be broken or not yet properly documented.
 
 - Nix users can use the `typst` package with `nix-shell -p typst` or build and
   run the bleeding edge version with `nix run github:typst/typst -- --version`.
@@ -147,18 +151,40 @@ Typst further allows you to add custom font paths for your project and list all
 of the fonts it discovered:
 ```sh
 # Adds additional directories to search for fonts.
-typst --font-path path/to/fonts compile file.typ
+typst compile --font-path path/to/fonts file.typ
 
 # Lists all of the discovered fonts in the system and the given directory.
-typst --font-path path/to/fonts fonts
+typst fonts --font-path path/to/fonts
 
 # Or via environment variable (Linux syntax).
 TYPST_FONT_PATHS=path/to/fonts typst fonts
 ```
 
+For other CLI subcommands and options, see below:
+```sh
+# Prints available subcommands and options.
+typst help
+
+# Prints detailed usage of a subcommand.
+typst help watch
+```
+
 If you prefer an integrated IDE-like experience with autocompletion and instant
 preview, you can also check out the [Typst web app][app], which is currently in
 public beta.
+
+## Community
+The main place where the community gathers is our [Discord server][discord].
+Feel free to join there to ask questions, help out others, share cool things
+you created with Typst, or just to chat.
+
+Aside from that there are a few places where you can find things built by
+the community:
+
+- The official [package list](https://typst.app/docs/packages)
+- The [Awesome Typst](https://github.com/qjcg/awesome-typst) repository
+
+If you had a bad experience in our community, please [reach out to us][contact].
 
 ## Contributing
 We would love to see contributions from the community. If you experience bugs,
@@ -221,6 +247,8 @@ instant preview. To achieve these goals, we follow three core design principles:
 [scripting]: https://typst.app/docs/reference/scripting/
 [rust]: https://rustup.rs/
 [releases]: https://github.com/typst/typst/releases/
+[repology]: https://repology.org/project/typst/versions
+[contact]: https://typst.app/contact
 [architecture]: https://github.com/typst/typst/blob/main/docs/dev/architecture.md
 [contributing]: https://github.com/typst/typst/blob/main/CONTRIBUTING.md
 [packages]: https://github.com/typst/packages/

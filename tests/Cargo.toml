@@ -1,31 +1,34 @@
 [package]
 name = "typst-tests"
-version.workspace = true
-rust-version.workspace = true
-authors.workspace = true
-edition.workspace = true
+version = { workspace = true }
+rust-version = { workspace = true }
+authors = { workspace = true }
+edition = { workspace = true }
 publish = false
-
-[dev-dependencies]
-typst = { path = "../crates/typst" }
-typst-library = { path = "../crates/typst-library" }
-comemo = "0.3"
-iai = { git = "https://github.com/reknih/iai" }
-once_cell = "1"
-oxipng = { version = "8.0.0", default-features = false, features = ["filetime", "parallel", "zopfli"] }
-rayon = "1.7.0"
-tiny-skia = "0.9.0"
-ttf-parser = "0.18.1"
-unscanny = "0.1"
-walkdir = "2"
-clap = { version = "4.2.4", features = ["derive"] }
 
 [[test]]
 name = "tests"
 path = "src/tests.rs"
 harness = false
 
-[[bench]]
-name = "benches"
-path = "src/benches.rs"
-harness = false
+[dependencies]
+typst = { workspace = true }
+typst-assets = { workspace = true, features = ["fonts"] }
+typst-dev-assets = { workspace = true }
+typst-pdf = { workspace = true }
+typst-render = { workspace = true }
+typst-svg = { workspace = true }
+clap = { workspace = true }
+comemo = { workspace = true }
+ecow = { workspace = true }
+once_cell = { workspace = true }
+oxipng = { workspace = true }
+parking_lot = { workspace = true }
+rayon = { workspace = true }
+tiny-skia = { workspace = true }
+ttf-parser = { workspace = true }
+unscanny = { workspace = true }
+walkdir = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,30 +1,46 @@
-use std::fs;
+use std::fs::{self, File};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+use chrono::{Datelike, Timelike};
 use codespan_reporting::diagnostic::{Diagnostic, Label};
-use codespan_reporting::term::{self, termcolor};
-use termcolor::{ColorChoice, StandardStream};
-use typst::diag::{bail, Severity, SourceDiagnostic, StrResult};
-use typst::doc::Document;
-use typst::eval::{eco_format, Tracer};
-use typst::geom::Color;
-use typst::syntax::{FileId, Source};
-use typst::World;
+use codespan_reporting::term;
+use ecow::{eco_format, EcoString};
+use parking_lot::RwLock;
+use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
+use typst::diag::{bail, At, Severity, SourceDiagnostic, StrResult};
+use typst::eval::Tracer;
+use typst::foundations::{Datetime, Smart};
+use typst::layout::Frame;
+use typst::model::Document;
+use typst::syntax::{FileId, Source, Span};
+use typst::visualize::Color;
+use typst::{World, WorldExt};
 
-use crate::args::{CompileCommand, DiagnosticFormat, OutputFormat};
+use crate::args::{CompileCommand, DiagnosticFormat, Input, Output, OutputFormat};
+use crate::timings::Timer;
 use crate::watch::Status;
 use crate::world::SystemWorld;
-use crate::{color_stream, set_failed};
+use crate::{set_failed, terminal};
 
 type CodespanResult<T> = Result<T, CodespanError>;
 type CodespanError = codespan_reporting::files::Error;
 
 impl CompileCommand {
     /// The output path.
-    pub fn output(&self) -> PathBuf {
-        self.output
-            .clone()
-            .unwrap_or_else(|| self.common.input.with_extension("pdf"))
+    pub fn output(&self) -> Output {
+        self.output.clone().unwrap_or_else(|| {
+            let Input::Path(path) = &self.common.input else {
+                panic!("output must be specified when input is from stdin, as guarded by the CLI");
+            };
+            Output::Path(path.with_extension(
+                match self.output_format().unwrap_or(OutputFormat::Pdf) {
+                    OutputFormat::Pdf => "pdf",
+                    OutputFormat::Png => "png",
+                    OutputFormat::Svg => "svg",
+                },
+            ))
+        })
     }
 
     /// The format to use for generated output, either specified by the user or inferred from the extension.
@@ -33,7 +49,7 @@ impl CompileCommand {
     pub fn output_format(&self) -> StrResult<OutputFormat> {
         Ok(if let Some(specified) = self.format {
             specified
-        } else if let Some(output) = &self.output {
+        } else if let Some(Output::Path(output)) = &self.output {
             match output.extension() {
                 Some(ext) if ext.eq_ignore_ascii_case("pdf") => OutputFormat::Pdf,
                 Some(ext) if ext.eq_ignore_ascii_case("png") => OutputFormat::Png,
@@ -47,43 +63,50 @@ impl CompileCommand {
 }
 
 /// Execute a compilation command.
-pub fn compile(mut command: CompileCommand) -> StrResult<()> {
-    let mut world = SystemWorld::new(&command.common)?;
-    compile_once(&mut world, &mut command, false)?;
+pub fn compile(mut timer: Timer, mut command: CompileCommand) -> StrResult<()> {
+    let mut world =
+        SystemWorld::new(&command.common).map_err(|err| eco_format!("{err}"))?;
+    timer.record(&mut world, |world| compile_once(world, &mut command, false))??;
     Ok(())
 }
 
 /// Compile a single time.
 ///
 /// Returns whether it compiled without errors.
-#[tracing::instrument(skip_all)]
+#[typst_macros::time(name = "compile once")]
 pub fn compile_once(
     world: &mut SystemWorld,
     command: &mut CompileCommand,
     watching: bool,
 ) -> StrResult<()> {
-    tracing::info!("Starting compilation");
-
     let start = std::time::Instant::now();
     if watching {
         Status::Compiling.print(command).unwrap();
     }
 
-    // Reset everything and ensure that the main file is present.
-    world.reset();
-    world.source(world.main()).map_err(|err| err.to_string())?;
+    // Check if main file can be read and opened.
+    if let Err(errors) = world.source(world.main()).at(Span::detached()) {
+        set_failed();
+        if watching {
+            Status::Error.print(command).unwrap();
+        }
 
-    let mut tracer = Tracer::default();
+        print_diagnostics(world, &errors, &[], command.common.diagnostic_format)
+            .map_err(|err| eco_format!("failed to print diagnostics ({err})"))?;
+
+        return Ok(());
+    }
+
+    let mut tracer = Tracer::new();
     let result = typst::compile(world, &mut tracer);
     let warnings = tracer.warnings();
 
     match result {
         // Export the PDF / PNG.
         Ok(document) => {
-            export(&document, command)?;
+            export(world, &document, command, watching)?;
             let duration = start.elapsed();
 
-            tracing::info!("Compilation succeeded in {duration:?}");
             if watching {
                 if warnings.is_empty() {
                     Status::Success(duration).print(command).unwrap();
@@ -93,17 +116,20 @@ pub fn compile_once(
             }
 
             print_diagnostics(world, &[], &warnings, command.common.diagnostic_format)
-                .map_err(|_| "failed to print diagnostics")?;
+                .map_err(|err| eco_format!("failed to print diagnostics ({err})"))?;
+
+            write_make_deps(world, command)?;
 
             if let Some(open) = command.open.take() {
-                open_file(open.as_deref(), &command.output())?;
+                if let Output::Path(file) = command.output() {
+                    open_file(open.as_deref(), &file)?;
+                }
             }
         }
 
         // Print diagnostics.
         Err(errors) => {
             set_failed();
-            tracing::info!("Compilation failed");
 
             if watching {
                 Status::Error.print(command).unwrap();
@@ -115,7 +141,7 @@ pub fn compile_once(
                 &warnings,
                 command.common.diagnostic_format,
             )
-            .map_err(|_| "failed to print diagnostics")?;
+            .map_err(|err| eco_format!("failed to print diagnostics ({err})"))?;
         }
     }
 
@@ -123,69 +149,270 @@ pub fn compile_once(
 }
 
 /// Export into the target format.
-fn export(document: &Document, command: &CompileCommand) -> StrResult<()> {
+fn export(
+    world: &mut SystemWorld,
+    document: &Document,
+    command: &CompileCommand,
+    watching: bool,
+) -> StrResult<()> {
     match command.output_format()? {
-        OutputFormat::Png => export_image(document, command, ImageExportFormat::Png),
-        OutputFormat::Svg => export_image(document, command, ImageExportFormat::Svg),
+        OutputFormat::Png => {
+            export_image(world, document, command, watching, ImageExportFormat::Png)
+        }
+        OutputFormat::Svg => {
+            export_image(world, document, command, watching, ImageExportFormat::Svg)
+        }
         OutputFormat::Pdf => export_pdf(document, command),
     }
 }
 
 /// Export to a PDF.
 fn export_pdf(document: &Document, command: &CompileCommand) -> StrResult<()> {
-    let output = command.output();
-    let buffer = typst::export::pdf(document);
-    fs::write(output, buffer).map_err(|_| "failed to write PDF file")?;
+    let timestamp = convert_datetime(
+        command.common.creation_timestamp.unwrap_or_else(chrono::Utc::now),
+    );
+    let buffer = typst_pdf::pdf(document, Smart::Auto, timestamp);
+    command
+        .output()
+        .write(&buffer)
+        .map_err(|err| eco_format!("failed to write PDF file ({err})"))?;
     Ok(())
 }
 
+/// Convert [`chrono::DateTime`] to [`Datetime`]
+fn convert_datetime(date_time: chrono::DateTime<chrono::Utc>) -> Option<Datetime> {
+    Datetime::from_ymd_hms(
+        date_time.year(),
+        date_time.month().try_into().ok()?,
+        date_time.day().try_into().ok()?,
+        date_time.hour().try_into().ok()?,
+        date_time.minute().try_into().ok()?,
+        date_time.second().try_into().ok()?,
+    )
+}
+
 /// An image format to export in.
+#[derive(Clone, Copy)]
 enum ImageExportFormat {
     Png,
     Svg,
 }
 
-/// Export to one or multiple PNGs.
+/// Export to one or multiple images.
 fn export_image(
+    world: &mut SystemWorld,
     document: &Document,
     command: &CompileCommand,
+    watching: bool,
     fmt: ImageExportFormat,
 ) -> StrResult<()> {
     // Determine whether we have a `{n}` numbering.
     let output = command.output();
-    let string = output.to_str().unwrap_or_default();
-    let numbered = string.contains("{n}");
-    if !numbered && document.pages.len() > 1 {
-        bail!("cannot export multiple images without `{{n}}` in output path");
+    let can_handle_multiple = match output {
+        Output::Stdout => false,
+        Output::Path(ref output) => output.to_str().unwrap_or_default().contains("{n}"),
+    };
+    if !can_handle_multiple && document.pages.len() > 1 {
+        let s = match output {
+            Output::Stdout => "to stdout",
+            Output::Path(_) => "without `{n}` in output path",
+        };
+        bail!("cannot export multiple images {s}");
     }
 
     // Find a number width that accommodates all pages. For instance, the
     // first page should be numbered "001" if there are between 100 and
     // 999 pages.
     let width = 1 + document.pages.len().checked_ilog10().unwrap_or(0) as usize;
-    let mut storage;
 
-    for (i, frame) in document.pages.iter().enumerate() {
-        let path = if numbered {
-            storage = string.replace("{n}", &format!("{:0width$}", i + 1));
-            Path::new(&storage)
-        } else {
-            output.as_path()
-        };
-        match fmt {
-            ImageExportFormat::Png => {
-                let pixmap =
-                    typst::export::render(frame, command.ppi / 72.0, Color::WHITE);
-                pixmap.save_png(path).map_err(|_| "failed to write PNG file")?;
-            }
-            ImageExportFormat::Svg => {
-                let svg = typst::export::svg(frame);
-                fs::write(path, svg).map_err(|_| "failed to write SVG file")?;
-            }
-        }
-    }
+    let cache = world.export_cache();
+
+    // The results are collected in a `Vec<()>` which does not allocate.
+    document
+        .pages
+        .par_iter()
+        .enumerate()
+        .map(|(i, page)| {
+            // Use output with converted path.
+            let output = match output {
+                Output::Path(ref path) => {
+                    let storage;
+                    let path = if can_handle_multiple {
+                        storage = path
+                            .to_str()
+                            .unwrap_or_default()
+                            .replace("{n}", &format!("{:0width$}", i + 1));
+                        Path::new(&storage)
+                    } else {
+                        path
+                    };
+
+                    // If we are not watching, don't use the cache.
+                    // If the frame is in the cache, skip it.
+                    // If the file does not exist, always create it.
+                    if watching && cache.is_cached(i, &page.frame) && path.exists() {
+                        return Ok(());
+                    }
+
+                    Output::Path(path.to_owned())
+                }
+                Output::Stdout => Output::Stdout,
+            };
+
+            export_image_page(command, &page.frame, &output, fmt)?;
+            Ok(())
+        })
+        .collect::<Result<Vec<()>, EcoString>>()?;
 
     Ok(())
+}
+
+/// Export single image.
+fn export_image_page(
+    command: &CompileCommand,
+    frame: &Frame,
+    output: &Output,
+    fmt: ImageExportFormat,
+) -> StrResult<()> {
+    match fmt {
+        ImageExportFormat::Png => {
+            let pixmap = typst_render::render(frame, command.ppi / 72.0, Color::WHITE);
+            let buf = pixmap
+                .encode_png()
+                .map_err(|err| eco_format!("failed to encode PNG file ({err})"))?;
+            output
+                .write(&buf)
+                .map_err(|err| eco_format!("failed to write PNG file ({err})"))?;
+        }
+        ImageExportFormat::Svg => {
+            let svg = typst_svg::svg(frame);
+            output
+                .write(svg.as_bytes())
+                .map_err(|err| eco_format!("failed to write SVG file ({err})"))?;
+        }
+    }
+    Ok(())
+}
+
+impl Output {
+    fn write(&self, buffer: &[u8]) -> StrResult<()> {
+        match self {
+            Output::Stdout => std::io::stdout().write_all(buffer),
+            Output::Path(path) => fs::write(path, buffer),
+        }
+        .map_err(|err| eco_format!("{err}"))
+    }
+}
+
+/// Caches exported files so that we can avoid re-exporting them if they haven't
+/// changed.
+///
+/// This is done by having a list of size `files.len()` that contains the hashes
+/// of the last rendered frame in each file. If a new frame is inserted, this
+/// will invalidate the rest of the cache, this is deliberate as to decrease the
+/// complexity and memory usage of such a cache.
+pub struct ExportCache {
+    /// The hashes of last compilation's frames.
+    pub cache: RwLock<Vec<u128>>,
+}
+
+impl ExportCache {
+    /// Creates a new export cache.
+    pub fn new() -> Self {
+        Self { cache: RwLock::new(Vec::with_capacity(32)) }
+    }
+
+    /// Returns true if the entry is cached and appends the new hash to the
+    /// cache (for the next compilation).
+    pub fn is_cached(&self, i: usize, frame: &Frame) -> bool {
+        let hash = typst::util::hash128(frame);
+
+        let mut cache = self.cache.upgradable_read();
+        if i >= cache.len() {
+            cache.with_upgraded(|cache| cache.push(hash));
+            return false;
+        }
+
+        cache.with_upgraded(|cache| std::mem::replace(&mut cache[i], hash) == hash)
+    }
+}
+
+/// Writes a Makefile rule describing the relationship between the output and
+/// its dependencies to the path specified by the --make-deps argument, if it
+/// was provided.
+fn write_make_deps(world: &mut SystemWorld, command: &CompileCommand) -> StrResult<()> {
+    let Some(ref make_deps_path) = command.make_deps else { return Ok(()) };
+    let Output::Path(output_path) = command.output() else {
+        bail!("failed to create make dependencies file because output was stdout")
+    };
+    let Ok(output_path) = output_path.into_os_string().into_string() else {
+        bail!("failed to create make dependencies file because output path was not valid unicode")
+    };
+
+    // Based on `munge` in libcpp/mkdeps.cc from the GCC source code. This isn't
+    // perfect as some special characters can't be escaped.
+    fn munge(s: &str) -> String {
+        let mut res = String::with_capacity(s.len());
+        let mut slashes = 0;
+        for c in s.chars() {
+            match c {
+                '\\' => slashes += 1,
+                '$' => {
+                    res.push('$');
+                    slashes = 0;
+                }
+                ' ' | '\t' => {
+                    // `munge`'s source contains a comment here that says: "A
+                    // space or tab preceded by 2N+1 backslashes represents N
+                    // backslashes followed by space..."
+                    for _ in 0..slashes + 1 {
+                        res.push('\\');
+                    }
+                    slashes = 0;
+                }
+                '#' => {
+                    res.push('\\');
+                    slashes = 0;
+                }
+                _ => slashes = 0,
+            };
+            res.push(c);
+        }
+        res
+    }
+
+    fn write(
+        make_deps_path: &Path,
+        output_path: String,
+        root: PathBuf,
+        dependencies: impl Iterator<Item = PathBuf>,
+    ) -> io::Result<()> {
+        let mut file = File::create(make_deps_path)?;
+
+        file.write_all(munge(&output_path).as_bytes())?;
+        file.write_all(b":")?;
+        for dependency in dependencies {
+            let Some(dependency) =
+                dependency.strip_prefix(&root).unwrap_or(&dependency).to_str()
+            else {
+                // Silently skip paths that aren't valid unicode so we still
+                // produce a rule that will work for the other paths that can be
+                // processed.
+                continue;
+            };
+
+            file.write_all(b" ")?;
+            file.write_all(munge(dependency).as_bytes())?;
+        }
+        file.write_all(b"\n")?;
+
+        Ok(())
+    }
+
+    write(make_deps_path, output_path, world.root().to_owned(), world.dependencies())
+        .map_err(|err| {
+            eco_format!("failed to create make dependencies file due to IO error ({err})")
+        })
 }
 
 /// Opens the given file using:
@@ -208,17 +435,12 @@ pub fn print_diagnostics(
     warnings: &[SourceDiagnostic],
     diagnostic_format: DiagnosticFormat,
 ) -> Result<(), codespan_reporting::files::Error> {
-    let mut w = match diagnostic_format {
-        DiagnosticFormat::Human => color_stream(),
-        DiagnosticFormat::Short => StandardStream::stderr(ColorChoice::Never),
-    };
-
     let mut config = term::Config { tab_width: 2, ..Default::default() };
     if diagnostic_format == DiagnosticFormat::Short {
         config.display_style = term::DisplayStyle::Short;
     }
 
-    for diagnostic in warnings.iter().chain(errors.iter()) {
+    for diagnostic in warnings.iter().chain(errors) {
         let diag = match diagnostic.severity {
             Severity::Error => Diagnostic::error(),
             Severity::Warning => Diagnostic::warning(),
@@ -231,25 +453,27 @@ pub fn print_diagnostics(
                 .map(|e| (eco_format!("hint: {e}")).into())
                 .collect(),
         )
-        .with_labels(vec![Label::primary(
-            diagnostic.span.id(),
-            world.range(diagnostic.span),
-        )]);
+        .with_labels(label(world, diagnostic.span).into_iter().collect());
 
-        term::emit(&mut w, &config, world, &diag)?;
+        term::emit(&mut terminal::out(), &config, world, &diag)?;
 
         // Stacktrace-like helper diagnostics.
         for point in &diagnostic.trace {
             let message = point.v.to_string();
-            let help = Diagnostic::help().with_message(message).with_labels(vec![
-                Label::primary(point.span.id(), world.range(point.span)),
-            ]);
+            let help = Diagnostic::help()
+                .with_message(message)
+                .with_labels(label(world, point.span).into_iter().collect());
 
-            term::emit(&mut w, &config, world, &help)?;
+            term::emit(&mut terminal::out(), &config, world, &help)?;
         }
     }
 
     Ok(())
+}
+
+/// Create a label for a span.
+fn label(world: &SystemWorld, span: Span) -> Option<Label<FileId>> {
+    Some(Label::primary(span.id()?, world.range(span)?))
 }
 
 impl<'a> codespan_reporting::files::Files<'a> for SystemWorld {
@@ -265,7 +489,7 @@ impl<'a> codespan_reporting::files::Files<'a> for SystemWorld {
             // Try to express the path relative to the working directory.
             vpath
                 .resolve(self.root())
-                .and_then(|abs| pathdiff::diff_paths(&abs, self.workdir()))
+                .and_then(|abs| pathdiff::diff_paths(abs, self.workdir()))
                 .as_deref()
                 .unwrap_or_else(|| vpath.as_rootless_path())
                 .to_string_lossy()

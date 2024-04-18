@@ -12,19 +12,17 @@ this roadmap will only list larger, more fundamental ones.
 Are you missing something on the roadmap? Typst relies on your feedback as a
 user to plan for and prioritize new features. Get started by filing a new issue
 on [GitHub](https://github.com/typst/typst/issues) or discuss your feature
-request with the [community]($community).
+request with the [community].
 
-## Language and Compiler { #language-and-compiler }
+## Language and Compiler
 - **Structure and Styling**
-  - Fix show rule recursion
-  - Fix show-set order
-  - Fix show-set where both show and set affect the same kind of element
-    (to set properties on elements that match a selector)
+  - Support for freezing content, so that e.g. numbers in it remain the same
+    if it appears multiple times
+  - Support for revoking style rules
   - Ancestry selectors (e.g., within)
-  - Custom elements (that work with set and show rules)
   - Possibly a capability system, e.g. to make your own element referenceable
 - **Layout**
-  - Floating layout
+  - Advanced floating layout
   - Rework layout engine to a more flexible model that has first-class support
     for both "normal" text layout and more canvas-like layout
   - Unified layout primitives across normal content and math
@@ -35,36 +33,24 @@ request with the [community]($community).
   - Grid-based typesetting
   - Layout with collision
 - **Export**
-  - Implement emoji export
-  - Implement transparency
-  - Fix SVG export issues
+  - Support for emojis in PDF
   - HTML export
   - EPUB export
   - Tagged PDF for Accessibility
   - PDF/A and PDF/X support
 - **Text and Fonts**
   - Font fallback warnings
-  - Fix SVG font fallback
-  - Proper foundations for i18n
   - Bold, italic, and smallcaps synthesis
   - Variable fonts support
   - Ruby and Warichu
   - Kashida justification
 - **Scripting**
-  - More fields and methods on primitives
-  - Import renaming with as
-  - Allow expressions as dictionary keys
-  - Make types first-class values and bring methods and functions closer
-    together
+  - Custom types (that work with set and show rules)
   - Function hoisting if possible
-  - Get values of set rules
   - Doc comments
   - Type hints
-  - WebAssembly integration
-  - Query from CLI
 - **Visualization**
   - Arrows
-  - Gradients
   - Better path drawing
   - Color management
 - **Tooling**
@@ -75,20 +61,15 @@ request with the [community]($community).
   - Benchmarking
   - Better contributor documentation
 
-## Library { #library }
+## Library
 - **Customization**
-  - Integrate CSL (Citation Style Language)
-  - Bibliography and citation customization
-  - Outline customization
-  - Table stroke customization
-  - Themes for raw text and more/custom syntaxes
+  - Richer built-in outline customization
 - **Numbering**
   - Relative counters, e.g. for figure numbering per section
   - Improve equation numbering
   - Fix issues with numbering patterns
   - Enum continuation
 - **Layout**
-  - Row span and column span in table
   - Balanced columns
   - Drop caps
   - End notes, maybe margin notes
@@ -96,29 +77,26 @@ request with the [community]($community).
   - Fix syntactic quirks
   - Fix font handling
   - Provide more primitives
-  - Smarter automatic delimiter sizing
-  - Augmented matrices
   - Big fractions
 - **Other**
   - Plotting
 
-## Web App { #web-app }
+## Web App
 - **Editing**
   - Smarter & more action buttons
-  - Basic, built-in image editor (cropping, etc.)
+  - Inline documentation
+  - Preview autocomplete entry
+  - Go-to-definition
   - Color Picker
   - Symbol picker
+  - Basic, built-in image editor (cropping, etc.)
   - GUI inspector for editing function calls
-  - Preview autocomplete entry
   - Cursor in preview
-  - Inline documentation
-  - More export options
-  - Preview in a separate window
 - **Writing**
   - Spell check
+  - Outline panel
   - Word count
   - Structure view
-  - Pomodoro
   - Text completion by LLM
 - **Collaboration**
   - Chat-like comments
@@ -129,11 +107,9 @@ request with the [community]($community).
   - Drag-and-drop for projects
   - Thumbnails for projects
   - Template generation by LLM
-  - LaTeX, Word, Markdown import
 - **Settings**
   - Keyboard shortcuts configuration
   - Better project settings
-  - System Theme setting
   - Avatar Cropping
 - **Other**
   - Offline PWA
@@ -141,5 +117,4 @@ request with the [community]($community).
   - Two-Factor Authentication
   - Advanced search in projects
   - Private packages in teams
-  - On-Premise deployment
   - Mobile improvements

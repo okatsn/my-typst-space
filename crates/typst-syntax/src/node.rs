@@ -3,10 +3,10 @@ use std::ops::{Deref, Range};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use ecow::EcoString;
+use ecow::{eco_format, eco_vec, EcoString, EcoVec};
 
-use super::ast::AstNode;
-use super::{FileId, Span, SyntaxKind};
+use crate::ast::AstNode;
+use crate::{FileId, Span, SyntaxKind};
 
 /// A node in the untyped syntax tree.
 #[derive(Clone, Eq, PartialEq, Hash)]
@@ -164,17 +164,22 @@ impl SyntaxNode {
             Repr::Error(node) => Arc::make_mut(node).error.span = span,
         }
     }
+
+    /// Whether the two syntax nodes are the same apart from spans.
+    pub fn spanless_eq(&self, other: &Self) -> bool {
+        match (&self.0, &other.0) {
+            (Repr::Leaf(a), Repr::Leaf(b)) => a.spanless_eq(b),
+            (Repr::Inner(a), Repr::Inner(b)) => a.spanless_eq(b),
+            (Repr::Error(a), Repr::Error(b)) => a.spanless_eq(b),
+            _ => false,
+        }
+    }
 }
 
 impl SyntaxNode {
-    /// Mark this node as erroneous.
-    pub(super) fn make_erroneous(&mut self) {
-        if let Repr::Inner(inner) = &mut self.0 {
-            Arc::make_mut(inner).erroneous = true;
-        }
-    }
-
     /// Convert the child to another kind.
+    ///
+    /// Don't use this for converting to an error!
     #[track_caller]
     pub(super) fn convert_to_kind(&mut self, kind: SyntaxKind) {
         debug_assert!(!kind.is_error());
@@ -185,14 +190,33 @@ impl SyntaxNode {
         }
     }
 
-    /// Convert the child to an error.
+    /// Convert the child to an error, if it isn't already one.
     pub(super) fn convert_to_error(&mut self, message: impl Into<EcoString>) {
-        let text = std::mem::take(self).into_text();
-        *self = SyntaxNode::error(message, text);
+        if !self.kind().is_error() {
+            let text = std::mem::take(self).into_text();
+            *self = SyntaxNode::error(message, text);
+        }
+    }
+
+    /// Convert the child to an error stating that the given thing was
+    /// expected, but the current kind was found.
+    pub(super) fn expected(&mut self, expected: &str) {
+        let kind = self.kind();
+        self.convert_to_error(eco_format!("expected {expected}, found {}", kind.name()));
+        if kind.is_keyword() && matches!(expected, "identifier" | "pattern") {
+            self.hint(eco_format!(
+                "keyword `{text}` is not allowed as an identifier; try `{text}_` instead",
+                text = self.text(),
+            ));
+        }
+    }
+
+    /// Convert the child to an error stating it was unexpected.
+    pub(super) fn unexpected(&mut self) {
+        self.convert_to_error(eco_format!("unexpected {}", self.kind().name()));
     }
 
     /// Assign spans to each node.
-    #[tracing::instrument(skip_all)]
     pub(super) fn numberize(
         &mut self,
         id: FileId,
@@ -202,7 +226,7 @@ impl SyntaxNode {
             return Err(Unnumberable);
         }
 
-        let mid = Span::new(id, (within.start + within.end) / 2);
+        let mid = Span::new(id, (within.start + within.end) / 2).unwrap();
         match &mut self.0 {
             Repr::Leaf(leaf) => leaf.span = mid,
             Repr::Inner(inner) => Arc::make_mut(inner).numberize(id, None, within)?,
@@ -279,7 +303,7 @@ impl SyntaxNode {
     /// In contrast to `default()`, this is a const fn.
     pub(super) const fn arbitrary() -> Self {
         Self(Repr::Leaf(LeafNode {
-            kind: SyntaxKind::Eof,
+            kind: SyntaxKind::End,
             text: EcoString::new(),
             span: Span::detached(),
         }))
@@ -325,6 +349,11 @@ impl LeafNode {
     /// The byte length of the node in the source text.
     fn len(&self) -> usize {
         self.text.len()
+    }
+
+    /// Whether the two leaf nodes are the same apart from spans.
+    fn spanless_eq(&self, other: &Self) -> bool {
+        self.kind == other.kind && self.text == other.text
     }
 }
 
@@ -424,7 +453,7 @@ impl InnerNode {
         let mut start = within.start;
         if range.is_none() {
             let end = start + stride;
-            self.span = Span::new(id, (start + end) / 2);
+            self.span = Span::new(id, (start + end) / 2).unwrap();
             self.upper = within.end;
             start = end;
         }
@@ -440,6 +469,20 @@ impl InnerNode {
         Ok(())
     }
 
+    /// Whether the two inner nodes are the same apart from spans.
+    fn spanless_eq(&self, other: &Self) -> bool {
+        self.kind == other.kind
+            && self.len == other.len
+            && self.descendants == other.descendants
+            && self.erroneous == other.erroneous
+            && self.children.len() == other.children.len()
+            && self
+                .children
+                .iter()
+                .zip(&other.children)
+                .all(|(a, b)| a.spanless_eq(b))
+    }
+
     /// Replaces a range of children with a replacement.
     ///
     /// May have mutated the children if it returns `Err(_)`.
@@ -448,6 +491,31 @@ impl InnerNode {
         mut range: Range<usize>,
         replacement: Vec<SyntaxNode>,
     ) -> NumberingResult {
+        let Some(id) = self.span.id() else { return Err(Unnumberable) };
+        let mut replacement_range = 0..replacement.len();
+
+        // Trim off common prefix.
+        while range.start < range.end
+            && replacement_range.start < replacement_range.end
+            && self.children[range.start]
+                .spanless_eq(&replacement[replacement_range.start])
+        {
+            range.start += 1;
+            replacement_range.start += 1;
+        }
+
+        // Trim off common suffix.
+        while range.start < range.end
+            && replacement_range.start < replacement_range.end
+            && self.children[range.end - 1]
+                .spanless_eq(&replacement[replacement_range.end - 1])
+        {
+            range.end -= 1;
+            replacement_range.end -= 1;
+        }
+
+        let mut replacement_vec = replacement;
+        let replacement = &replacement_vec[replacement_range.clone()];
         let superseded = &self.children[range.clone()];
 
         // Compute the new byte length.
@@ -469,9 +537,9 @@ impl InnerNode {
                 || self.children[range.end..].iter().any(SyntaxNode::erroneous));
 
         // Perform the replacement.
-        let replacement_count = replacement.len();
-        self.children.splice(range.clone(), replacement);
-        range.end = range.start + replacement_count;
+        self.children
+            .splice(range.clone(), replacement_vec.drain(replacement_range.clone()));
+        range.end = range.start + replacement_range.len();
 
         // Renumber the new children. Retries until it works, taking
         // exponentially more children into account.
@@ -505,7 +573,6 @@ impl InnerNode {
 
             // Try to renumber.
             let within = start_number..end_number;
-            let id = self.span.id();
             if self.numberize(id, Some(renumber), within).is_ok() {
                 return Ok(());
             }
@@ -563,7 +630,7 @@ impl ErrorNode {
             error: SyntaxError {
                 span: Span::detached(),
                 message: message.into(),
-                hints: vec![],
+                hints: eco_vec![],
             },
         }
     }
@@ -576,6 +643,11 @@ impl ErrorNode {
     /// Add a user-presentable hint to this error node.
     fn hint(&mut self, hint: impl Into<EcoString>) {
         self.error.hints.push(hint.into());
+    }
+
+    /// Whether the two leaf nodes are the same apart from spans.
+    fn spanless_eq(&self, other: &Self) -> bool {
+        self.text == other.text && self.error.spanless_eq(&other.error)
     }
 }
 
@@ -592,9 +664,16 @@ pub struct SyntaxError {
     pub span: Span,
     /// The error message.
     pub message: EcoString,
-    /// Additonal hints to the user, indicating how this error could be avoided
+    /// Additional hints to the user, indicating how this error could be avoided
     /// or worked around.
-    pub hints: Vec<EcoString>,
+    pub hints: EcoVec<EcoString>,
+}
+
+impl SyntaxError {
+    /// Whether the two errors are the same apart from spans.
+    fn spanless_eq(&self, other: &Self) -> bool {
+        self.message == other.message && self.hints == other.hints
+    }
 }
 
 /// A syntax node in a context.
@@ -732,6 +811,13 @@ impl<'a> LinkedNode<'a> {
     }
 }
 
+/// Indicates whether the cursor is before the related byte index, or after.
+#[derive(Debug, Clone)]
+pub enum Side {
+    Before,
+    After,
+}
+
 /// Access to leafs.
 impl<'a> LinkedNode<'a> {
     /// Get the rightmost non-trivia leaf before this node.
@@ -761,8 +847,8 @@ impl<'a> LinkedNode<'a> {
         None
     }
 
-    /// Get the leaf at the specified byte offset.
-    pub fn leaf_at(&self, cursor: usize) -> Option<Self> {
+    /// Get the leaf immediately before the specified byte offset.
+    fn leaf_before(&self, cursor: usize) -> Option<Self> {
         if self.node.children().len() == 0 && cursor <= self.offset + self.len() {
             return Some(self.clone());
         }
@@ -774,12 +860,38 @@ impl<'a> LinkedNode<'a> {
             if (offset < cursor && cursor <= offset + len)
                 || (offset == cursor && i + 1 == count)
             {
-                return child.leaf_at(cursor);
+                return child.leaf_before(cursor);
             }
             offset += len;
         }
 
         None
+    }
+
+    /// Get the leaf after the specified byte offset.
+    fn leaf_after(&self, cursor: usize) -> Option<Self> {
+        if self.node.children().len() == 0 && cursor < self.offset + self.len() {
+            return Some(self.clone());
+        }
+
+        let mut offset = self.offset;
+        for child in self.children() {
+            let len = child.len();
+            if offset <= cursor && cursor < offset + len {
+                return child.leaf_after(cursor);
+            }
+            offset += len;
+        }
+
+        None
+    }
+
+    /// Get the leaf at the specified byte offset.
+    pub fn leaf_at(&self, cursor: usize, side: Side) -> Option<Self> {
+        match side {
+            Side::Before => self.leaf_before(cursor),
+            Side::After => self.leaf_after(cursor),
+        }
     }
 
     /// Find the rightmost contained non-trivia leaf.
@@ -895,8 +1007,13 @@ mod tests {
     fn test_linked_node() {
         let source = Source::detached("#set text(12pt, red)");
 
-        // Find "text".
-        let node = LinkedNode::new(source.root()).leaf_at(7).unwrap();
+        // Find "text" with Before.
+        let node = LinkedNode::new(source.root()).leaf_at(7, Side::Before).unwrap();
+        assert_eq!(node.offset(), 5);
+        assert_eq!(node.text(), "text");
+
+        // Find "text" with After.
+        let node = LinkedNode::new(source.root()).leaf_at(7, Side::After).unwrap();
         assert_eq!(node.offset(), 5);
         assert_eq!(node.text(), "text");
 
@@ -909,17 +1026,26 @@ mod tests {
     #[test]
     fn test_linked_node_non_trivia_leaf() {
         let source = Source::detached("#set fun(12pt, red)");
-        let leaf = LinkedNode::new(source.root()).leaf_at(6).unwrap();
+        let leaf = LinkedNode::new(source.root()).leaf_at(6, Side::Before).unwrap();
         let prev = leaf.prev_leaf().unwrap();
         assert_eq!(leaf.text(), "fun");
         assert_eq!(prev.text(), "set");
 
+        // Check position 9 with Before.
         let source = Source::detached("#let x = 10");
-        let leaf = LinkedNode::new(source.root()).leaf_at(9).unwrap();
+        let leaf = LinkedNode::new(source.root()).leaf_at(9, Side::Before).unwrap();
         let prev = leaf.prev_leaf().unwrap();
         let next = leaf.next_leaf().unwrap();
         assert_eq!(prev.text(), "=");
         assert_eq!(leaf.text(), " ");
         assert_eq!(next.text(), "10");
+
+        // Check position 9 with After.
+        let source = Source::detached("#let x = 10");
+        let leaf = LinkedNode::new(source.root()).leaf_at(9, Side::After).unwrap();
+        let prev = leaf.prev_leaf().unwrap();
+        assert!(leaf.next_leaf().is_none());
+        assert_eq!(prev.text(), "=");
+        assert_eq!(leaf.text(), "10");
     }
 }
