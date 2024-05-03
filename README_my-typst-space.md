@@ -2,6 +2,13 @@
 
 https://github.com/okatsn/my-typst-space
 
+## Build
+
+```bash
+docker build -t okatsn/my-typst-space:latest .
+docker push okatsn/my-typst-space:latest
+```
+
 ## Use the image `okatsn/my-typst-space`
 
 !!! note
@@ -11,7 +18,7 @@ https://github.com/okatsn/my-typst-space
     - https://github.com/okatsn/MyQuartoSpace/commit/95b41ebcb4cfc0fb213fbc442d751ccfb9d818ce
 
 In your `.devcontainer/Dockerfile`:
-- Add `FROM okatsn/my-typst-space AS build0` at the very beginning
+- Add `FROM okatsn/my-typst-space:latest AS build0` at the very beginning
 - Add `COPY --from=build0 /bin/typst /bin` at the very end
 
 In your `.devcontainer/devcontainer.json`
