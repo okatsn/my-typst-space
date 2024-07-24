@@ -94,12 +94,8 @@
     "watch": "tsc -watch -p ./"
   },
   "devDependencies": {
-    "@types/node": "18.x",
     "@types/vscode": "^1.88.0",
+    "@types/node": "18.x",
     "typescript": "^5.3.3"
-  },
-  "engines": {
-    "vscode": "^1.88.0"
   }
 }
-

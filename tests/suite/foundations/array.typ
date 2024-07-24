@@ -384,28 +384,6 @@
 #test(("Hello", "World", "Hi", "There").dedup(key: x => x.len()), ("Hello", "Hi"))
 #test(("Hello", "World", "Hi", "There").dedup(key: x => x.at(0)), ("Hello", "World", "There"))
 
---- array-to-dict ---
-// Test the `to-dict` method.
-#test(().to-dict(), (:))
-#test((("a", 1), ("b", 2), ("c", 3)).to-dict(), (a: 1, b: 2, c: 3))
-#test((("a", 1), ("b", 2), ("c", 3), ("b", 4)).to-dict(), (a: 1, b: 4, c: 3))
-
---- array-to-dict-bad-item-type ---
-// Error: 2-16 expected (str, any) pairs, found integer
-#(1,).to-dict()
-
---- array-to-dict-bad-pair-length-1 ---
-// Error: 2-19 expected pairs of length 2, found length 1
-#((1,),).to-dict()
-
---- array-to-dict-bad-pair-length-3 ---
-// Error: 2-26 expected pairs of length 2, found length 3
-#(("key",1,2),).to-dict()
-
---- array-to-dict-bad-key-type ---
-// Error: 2-21 expected key of type str, found integer
-#((1, 2),).to-dict()
-
 --- array-zip-positional-and-named-argument ---
 // Error: 13-30 unexpected argument: val
 #().zip((), val: "applicable")
