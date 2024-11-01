@@ -14,6 +14,7 @@ readme = { workspace = true }
 
 [dependencies]
 typst = { workspace = true }
+typst-eval = { workspace = true }
 comemo = { workspace = true }
 ecow = { workspace = true }
 if_chain = { workspace = true }
@@ -22,7 +23,7 @@ serde = { workspace = true }
 unscanny = { workspace = true }
 
 [dev-dependencies]
-typst-assets = { workspace = true }
+typst-assets = { workspace = true, features = ["fonts"] }
 typst-dev-assets = { workspace = true }
 once_cell = { workspace = true }
 

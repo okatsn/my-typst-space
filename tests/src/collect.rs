@@ -3,6 +3,7 @@ use std::fmt::{self, Display, Formatter};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::LazyLock;
 
 use ecow::{eco_format, EcoString};
 use typst::syntax::package::PackageVersion;
@@ -48,7 +49,11 @@ impl FilePos {
 
 impl Display for FilePos {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        write!(f, "{}:{}", self.path.display(), self.line)
+        if self.line > 0 {
+            write!(f, "{}:{}", self.path.display(), self.line)
+        } else {
+            write!(f, "{}", self.path.display())
+        }
     }
 }
 
@@ -257,7 +262,7 @@ impl<'a> Parser<'a> {
                 self.collector.large.insert(name.clone());
             }
 
-            if !filtered(&name) {
+            if !selected(&name, self.path.canonicalize().unwrap()) {
                 self.collector.skipped += 1;
                 continue;
             }
@@ -383,20 +388,41 @@ impl<'a> Parser<'a> {
     }
 }
 
-/// Whether a test is within the filtered set.
-fn filtered(name: &str) -> bool {
+/// Whether a test is within the selected set to run.
+fn selected(name: &str, abs: PathBuf) -> bool {
+    static SKIPPED: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
+        String::leak(std::fs::read_to_string(crate::SKIP_PATH).unwrap())
+            .lines()
+            .map(|line| line.trim())
+            .filter(|line| !line.is_empty() && !line.starts_with("//"))
+            .collect()
+    });
+
+    if SKIPPED.contains(name) {
+        return false;
+    }
+
+    let paths = &crate::ARGS.path;
+    if !paths.is_empty() && !paths.iter().any(|path| abs.starts_with(path)) {
+        return false;
+    }
+
     let exact = crate::ARGS.exact;
-    let filter = &crate::ARGS.filter;
-    filter.is_empty()
-        || filter
-            .iter()
-            .any(|v| if exact { name == v } else { name.contains(v) })
+    let patterns = &crate::ARGS.pattern;
+    patterns.is_empty()
+        || patterns.iter().any(|pattern: &regex::Regex| {
+            if exact {
+                name == pattern.as_str()
+            } else {
+                pattern.is_match(name)
+            }
+        })
 }
 
 /// An error in a test file.
 pub struct TestParseError {
-    pos: FilePos,
-    message: String,
+    pub pos: FilePos,
+    pub message: String,
 }
 
 impl Display for TestParseError {

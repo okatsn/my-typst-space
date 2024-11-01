@@ -7,17 +7,21 @@ use codespan_reporting::diagnostic::{Diagnostic, Label};
 use codespan_reporting::term;
 use ecow::{eco_format, EcoString};
 use parking_lot::RwLock;
-use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
-use typst::diag::{bail, At, Severity, SourceDiagnostic, StrResult};
-use typst::eval::Tracer;
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+use typst::diag::{
+    bail, At, Severity, SourceDiagnostic, SourceResult, StrResult, Warned,
+};
 use typst::foundations::{Datetime, Smart};
-use typst::layout::Frame;
+use typst::layout::{Frame, Page, PageRanges};
 use typst::model::Document;
 use typst::syntax::{FileId, Source, Span};
-use typst::visualize::Color;
-use typst::{World, WorldExt};
+use typst::WorldExt;
+use typst_pdf::{PdfOptions, PdfStandards};
 
-use crate::args::{CompileCommand, DiagnosticFormat, Input, Output, OutputFormat};
+use crate::args::{
+    CompileCommand, DiagnosticFormat, Input, Output, OutputFormat, PageRangeArgument,
+    PdfStandard,
+};
 use crate::timings::Timer;
 use crate::watch::Status;
 use crate::world::SystemWorld;
@@ -54,16 +58,47 @@ impl CompileCommand {
                 Some(ext) if ext.eq_ignore_ascii_case("pdf") => OutputFormat::Pdf,
                 Some(ext) if ext.eq_ignore_ascii_case("png") => OutputFormat::Png,
                 Some(ext) if ext.eq_ignore_ascii_case("svg") => OutputFormat::Svg,
-                _ => bail!("could not infer output format for path {}.\nconsider providing the format manually with `--format/-f`", output.display()),
+                _ => bail!(
+                    "could not infer output format for path {}.\n\
+                     consider providing the format manually with `--format/-f`",
+                    output.display()
+                ),
             }
         } else {
             OutputFormat::Pdf
         })
     }
+
+    /// The ranges of the pages to be exported as specified by the user.
+    ///
+    /// This returns `None` if all pages should be exported.
+    pub fn exported_page_ranges(&self) -> Option<PageRanges> {
+        self.pages.as_ref().map(|export_ranges| {
+            PageRanges::new(
+                export_ranges.iter().map(PageRangeArgument::to_range).collect(),
+            )
+        })
+    }
+
+    /// The PDF standards to try to conform with.
+    pub fn pdf_standards(&self) -> StrResult<PdfStandards> {
+        let list = self
+            .pdf_standard
+            .iter()
+            .map(|standard| match standard {
+                PdfStandard::V_1_7 => typst_pdf::PdfStandard::V_1_7,
+                PdfStandard::A_2b => typst_pdf::PdfStandard::A_2b,
+            })
+            .collect::<Vec<_>>();
+        PdfStandards::new(&list)
+    }
 }
 
 /// Execute a compilation command.
 pub fn compile(mut timer: Timer, mut command: CompileCommand) -> StrResult<()> {
+    // Only meant for input validation
+    _ = command.output_format()?;
+
     let mut world =
         SystemWorld::new(&command.common).map_err(|err| eco_format!("{err}"))?;
     timer.record(&mut world, |world| compile_once(world, &mut command, false))??;
@@ -84,27 +119,12 @@ pub fn compile_once(
         Status::Compiling.print(command).unwrap();
     }
 
-    // Check if main file can be read and opened.
-    if let Err(errors) = world.source(world.main()).at(Span::detached()) {
-        set_failed();
-        if watching {
-            Status::Error.print(command).unwrap();
-        }
-
-        print_diagnostics(world, &errors, &[], command.common.diagnostic_format)
-            .map_err(|err| eco_format!("failed to print diagnostics ({err})"))?;
-
-        return Ok(());
-    }
-
-    let mut tracer = Tracer::new();
-    let result = typst::compile(world, &mut tracer);
-    let warnings = tracer.warnings();
+    let Warned { output, warnings } = typst::compile(world);
+    let result = output.and_then(|document| export(world, &document, command, watching));
 
     match result {
         // Export the PDF / PNG.
-        Ok(document) => {
-            export(world, &document, command, watching)?;
+        Ok(()) => {
             let duration = start.elapsed();
 
             if watching {
@@ -154,28 +174,36 @@ fn export(
     document: &Document,
     command: &CompileCommand,
     watching: bool,
-) -> StrResult<()> {
-    match command.output_format()? {
+) -> SourceResult<()> {
+    match command.output_format().at(Span::detached())? {
         OutputFormat::Png => {
             export_image(world, document, command, watching, ImageExportFormat::Png)
+                .at(Span::detached())
         }
         OutputFormat::Svg => {
             export_image(world, document, command, watching, ImageExportFormat::Svg)
+                .at(Span::detached())
         }
         OutputFormat::Pdf => export_pdf(document, command),
     }
 }
 
 /// Export to a PDF.
-fn export_pdf(document: &Document, command: &CompileCommand) -> StrResult<()> {
-    let timestamp = convert_datetime(
-        command.common.creation_timestamp.unwrap_or_else(chrono::Utc::now),
-    );
-    let buffer = typst_pdf::pdf(document, Smart::Auto, timestamp);
+fn export_pdf(document: &Document, command: &CompileCommand) -> SourceResult<()> {
+    let options = PdfOptions {
+        ident: Smart::Auto,
+        timestamp: convert_datetime(
+            command.common.creation_timestamp.unwrap_or_else(chrono::Utc::now),
+        ),
+        page_ranges: command.exported_page_ranges(),
+        standards: command.pdf_standards().at(Span::detached())?,
+    };
+    let buffer = typst_pdf::pdf(document, &options)?;
     command
         .output()
         .write(&buffer)
-        .map_err(|err| eco_format!("failed to write PDF file ({err})"))?;
+        .map_err(|err| eco_format!("failed to write PDF file ({err})"))
+        .at(Span::detached())?;
     Ok(())
 }
 
@@ -206,42 +234,54 @@ fn export_image(
     watching: bool,
     fmt: ImageExportFormat,
 ) -> StrResult<()> {
-    // Determine whether we have a `{n}` numbering.
     let output = command.output();
+    // Determine whether we have indexable templates in output
     let can_handle_multiple = match output {
         Output::Stdout => false,
-        Output::Path(ref output) => output.to_str().unwrap_or_default().contains("{n}"),
+        Output::Path(ref output) => {
+            output_template::has_indexable_template(output.to_str().unwrap_or_default())
+        }
     };
-    if !can_handle_multiple && document.pages.len() > 1 {
-        let s = match output {
-            Output::Stdout => "to stdout",
-            Output::Path(_) => "without `{n}` in output path",
-        };
-        bail!("cannot export multiple images {s}");
-    }
 
-    // Find a number width that accommodates all pages. For instance, the
-    // first page should be numbered "001" if there are between 100 and
-    // 999 pages.
-    let width = 1 + document.pages.len().checked_ilog10().unwrap_or(0) as usize;
+    let exported_page_ranges = command.exported_page_ranges();
+
+    let exported_pages = document
+        .pages
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| {
+            exported_page_ranges.as_ref().map_or(true, |exported_page_ranges| {
+                exported_page_ranges.includes_page_index(*i)
+            })
+        })
+        .collect::<Vec<_>>();
+
+    if !can_handle_multiple && exported_pages.len() > 1 {
+        let err = match output {
+            Output::Stdout => "to stdout",
+            Output::Path(_) => {
+                "without a page number template ({p}, {0p}) in the output path"
+            }
+        };
+        bail!("cannot export multiple images {err}");
+    }
 
     let cache = world.export_cache();
 
     // The results are collected in a `Vec<()>` which does not allocate.
-    document
-        .pages
+    exported_pages
         .par_iter()
-        .enumerate()
         .map(|(i, page)| {
             // Use output with converted path.
             let output = match output {
                 Output::Path(ref path) => {
                     let storage;
                     let path = if can_handle_multiple {
-                        storage = path
-                            .to_str()
-                            .unwrap_or_default()
-                            .replace("{n}", &format!("{:0width$}", i + 1));
+                        storage = output_template::format(
+                            path.to_str().unwrap_or_default(),
+                            i + 1,
+                            document.pages.len(),
+                        );
                         Path::new(&storage)
                     } else {
                         path
@@ -250,7 +290,7 @@ fn export_image(
                     // If we are not watching, don't use the cache.
                     // If the frame is in the cache, skip it.
                     // If the file does not exist, always create it.
-                    if watching && cache.is_cached(i, &page.frame) && path.exists() {
+                    if watching && cache.is_cached(*i, &page.frame) && path.exists() {
                         return Ok(());
                     }
 
@@ -259,7 +299,7 @@ fn export_image(
                 Output::Stdout => Output::Stdout,
             };
 
-            export_image_page(command, &page.frame, &output, fmt)?;
+            export_image_page(command, page, &output, fmt)?;
             Ok(())
         })
         .collect::<Result<Vec<()>, EcoString>>()?;
@@ -267,16 +307,45 @@ fn export_image(
     Ok(())
 }
 
+mod output_template {
+    const INDEXABLE: [&str; 3] = ["{p}", "{0p}", "{n}"];
+
+    pub fn has_indexable_template(output: &str) -> bool {
+        INDEXABLE.iter().any(|template| output.contains(template))
+    }
+
+    pub fn format(output: &str, this_page: usize, total_pages: usize) -> String {
+        // Find the base 10 width of number `i`
+        fn width(i: usize) -> usize {
+            1 + i.checked_ilog10().unwrap_or(0) as usize
+        }
+
+        let other_templates = ["{t}"];
+        INDEXABLE.iter().chain(other_templates.iter()).fold(
+            output.to_string(),
+            |out, template| {
+                let replacement = match *template {
+                    "{p}" => format!("{this_page}"),
+                    "{0p}" | "{n}" => format!("{:01$}", this_page, width(total_pages)),
+                    "{t}" => format!("{total_pages}"),
+                    _ => unreachable!("unhandled template placeholder {template}"),
+                };
+                out.replace(template, replacement.as_str())
+            },
+        )
+    }
+}
+
 /// Export single image.
 fn export_image_page(
     command: &CompileCommand,
-    frame: &Frame,
+    page: &Page,
     output: &Output,
     fmt: ImageExportFormat,
 ) -> StrResult<()> {
     match fmt {
         ImageExportFormat::Png => {
-            let pixmap = typst_render::render(frame, command.ppi / 72.0, Color::WHITE);
+            let pixmap = typst_render::render(page, command.ppi / 72.0);
             let buf = pixmap
                 .encode_png()
                 .map_err(|err| eco_format!("failed to encode PNG file ({err})"))?;
@@ -285,7 +354,7 @@ fn export_image_page(
                 .map_err(|err| eco_format!("failed to write PNG file ({err})"))?;
         }
         ImageExportFormat::Svg => {
-            let svg = typst_svg::svg(frame);
+            let svg = typst_svg::svg(page);
             output
                 .write(svg.as_bytes())
                 .map_err(|err| eco_format!("failed to write SVG file ({err})"))?;
@@ -325,7 +394,7 @@ impl ExportCache {
     /// Returns true if the entry is cached and appends the new hash to the
     /// cache (for the next compilation).
     pub fn is_cached(&self, i: usize, frame: &Frame) -> bool {
-        let hash = typst::util::hash128(frame);
+        let hash = typst::utils::hash128(frame);
 
         let mut cache = self.cache.upgradable_read();
         if i >= cache.len() {
@@ -418,14 +487,30 @@ fn write_make_deps(world: &mut SystemWorld, command: &CompileCommand) -> StrResu
 /// Opens the given file using:
 /// - The default file viewer if `open` is `None`.
 /// - The given viewer provided by `open` if it is `Some`.
+///
+/// If the file could not be opened, an error is returned.
 fn open_file(open: Option<&str>, path: &Path) -> StrResult<()> {
+    // Some resource openers require the path to be canonicalized.
+    let path = path
+        .canonicalize()
+        .map_err(|err| eco_format!("failed to canonicalize path ({err})"))?;
     if let Some(app) = open {
-        open::with_in_background(path, app);
+        open::with_detached(&path, app)
+            .map_err(|err| eco_format!("failed to open file with {} ({})", app, err))
     } else {
-        open::that_in_background(path);
+        open::that_detached(&path).map_err(|err| {
+            let openers = open::commands(path)
+                .iter()
+                .map(|command| command.get_program().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(", ");
+            eco_format!(
+                "failed to open file with any of these resource openers: {} ({})",
+                openers,
+                err,
+            )
+        })
     }
-
-    Ok(())
 }
 
 /// Print diagnostic messages to the terminal.

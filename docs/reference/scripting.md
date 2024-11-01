@@ -68,8 +68,9 @@ As already demonstrated above, variables can be defined with `{let}` bindings.
 The variable is assigned the value of the expression that follows the `=` sign.
 The assignment of a value is optional, if no value is assigned, the variable
 will be initialized as `{none}`. The `{let}` keyword can also be used to create
-a [custom named function]($function/#defining-functions). Let bindings can be
-accessed for the rest of the containing block or document.
+a [custom named function]($function/#defining-functions). Variables can be
+accessed for the rest of the containing block (or the rest of the file if there
+is no containing block).
 
 ```example
 #let name = "Typst"
@@ -272,9 +273,9 @@ of each type lists it's scoped functions. You cannot currently define your own
 methods.
 
 ```example
-#let array = (1, 2, 3, 4)
-#array.pop() \
-#array.len() \
+#let values = (1, 2, 3, 4)
+#values.pop() \
+#values.len() \
 
 #("a, b, c"
     .split(", ")
@@ -301,7 +302,8 @@ ways:
 - **Import:** `{import "bar.typ"}` \
   Evaluates the file at the path `bar.typ` and inserts the resulting [module]
   into the current scope as `bar` (filename without extension). You can use the
-  `as` keyword to rename the imported module: `{import "bar.typ" as baz}`
+  `as` keyword to rename the imported module: `{import "bar.typ" as baz}`. You
+  can import nested items using dot notation: `{import "bar.typ": baz.a}`.
 
 - **Import items:** `{import "bar.typ": a, b}` \
   Evaluates the file at the path `bar.typ`, extracts the values of the variables

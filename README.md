@@ -32,8 +32,7 @@ as LaTeX while being much easier to learn and use. Typst has:
 
 This repository contains the Typst compiler and its CLI, which is everything you
 need to compile Typst documents locally. For the best writing experience,
-consider signing up to our [collaborative online editor][app] for free. It is
-currently in public beta.
+consider signing up to our [collaborative online editor][app] for free.
 
 ## Example
 A [gentle introduction][tutorial] to Typst is available in our documentation.
@@ -118,16 +117,19 @@ Typst's CLI is available from different sources:
   - macOS: `brew install typst`
   - Windows: `winget install --id Typst.Typst`
 
-- If you have a [Rust][rust] toolchain installed, you can also install the
-  latest development version with
-  `cargo install --git https://github.com/typst/typst --locked typst-cli`. Note that this
-  will be a "nightly" version that may be broken or not yet properly documented.
+- If you have a [Rust][rust] toolchain installed, you can install
+  - the latest released Typst version with
+    `cargo install --locked typst-cli`
+  - a development version with
+    `cargo install --git https://github.com/typst/typst --locked typst-cli`
 
-- Nix users can use the `typst` package with `nix-shell -p typst` or build and
-  run the bleeding edge version with `nix run github:typst/typst -- --version`.
+- Nix users can
+  - use the `typst` package with `nix-shell -p typst`
+  - build and run a development version with
+    `nix run github:typst/typst -- --version`.
 
 - Docker users can run a prebuilt image with
-  `docker run -it ghcr.io/typst/typst:latest`.
+  `docker run ghcr.io/typst/typst:latest --help`.
 
 ## Usage
 Once you have installed Typst, you can use it like this:
@@ -170,8 +172,7 @@ typst help watch
 ```
 
 If you prefer an integrated IDE-like experience with autocompletion and instant
-preview, you can also check out the [Typst web app][app], which is currently in
-public beta.
+preview, you can also check out [Typst's free web app][app].
 
 ## Community
 The main place where the community gathers is our [Discord server][discord].

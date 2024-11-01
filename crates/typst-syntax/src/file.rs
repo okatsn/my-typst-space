@@ -2,16 +2,15 @@
 
 use std::collections::HashMap;
 use std::fmt::{self, Debug, Formatter};
-use std::sync::RwLock;
-
-use once_cell::sync::Lazy;
+use std::sync::{LazyLock, RwLock};
 
 use crate::package::PackageSpec;
 use crate::VirtualPath;
 
 /// The global package-path interner.
-static INTERNER: Lazy<RwLock<Interner>> =
-    Lazy::new(|| RwLock::new(Interner { to_id: HashMap::new(), from_id: Vec::new() }));
+static INTERNER: LazyLock<RwLock<Interner>> = LazyLock::new(|| {
+    RwLock::new(Interner { to_id: HashMap::new(), from_id: Vec::new() })
+});
 
 /// A package-path interner.
 struct Interner {
@@ -36,17 +35,20 @@ impl FileId {
     #[track_caller]
     pub fn new(package: Option<PackageSpec>, path: VirtualPath) -> Self {
         // Try to find an existing entry that we can reuse.
+        //
+        // We could check with just a read lock, but if the pair is not yet
+        // present, we would then need to recheck after acquiring a write lock,
+        // which is probably not worth it.
         let pair = (package, path);
-        if let Some(&id) = INTERNER.read().unwrap().to_id.get(&pair) {
+        let mut interner = INTERNER.write().unwrap();
+        if let Some(&id) = interner.to_id.get(&pair) {
             return id;
         }
-
-        let mut interner = INTERNER.write().unwrap();
-        let num = interner.from_id.len().try_into().expect("out of file ids");
 
         // Create a new entry forever by leaking the pair. We can't leak more
         // than 2^16 pair (and typically will leak a lot less), so its not a
         // big deal.
+        let num = interner.from_id.len().try_into().expect("out of file ids");
         let id = FileId(num);
         let leaked = Box::leak(Box::new(pair));
         interner.to_id.insert(leaked, id);
@@ -88,13 +90,22 @@ impl FileId {
         Self::new(self.package().cloned(), self.vpath().join(path))
     }
 
+    /// The same file location, but with a different extension.
+    pub fn with_extension(&self, extension: &str) -> Self {
+        Self::new(self.package().cloned(), self.vpath().with_extension(extension))
+    }
+
     /// Construct from a raw number.
-    pub(crate) const fn from_raw(v: u16) -> Self {
+    ///
+    /// Should only be used with numbers retrieved via
+    /// [`into_raw`](Self::into_raw). Misuse may results in panics, but no
+    /// unsafety.
+    pub const fn from_raw(v: u16) -> Self {
         Self(v)
     }
 
     /// Extract the raw underlying number.
-    pub(crate) const fn into_raw(self) -> u16 {
+    pub const fn into_raw(self) -> u16 {
         self.0
     }
 

@@ -22,6 +22,7 @@
 
 --- array-bad-token ---
 // Error: 4-6 unexpected end of block comment
+// Hint: 4-6 consider escaping the `*` with a backslash or opening the block comment with `/*`
 #(1*/2)
 
 --- array-bad-number-suffix ---
@@ -173,7 +174,7 @@
 }
 
 --- array-first-and-last ---
-// The the `first` and `last` methods.
+// The `first` and `last` methods.
 #test((1,).first(), 1)
 #test((2,).last(), 2)
 #test((1, 2, 3).first(), 1)
@@ -328,6 +329,21 @@
 // Error: 19-21 number must be positive
 #(1, 2, 3).chunks(-5)
 
+--- array-windows ---
+// Test the `windows` method.
+#test(().windows(5), ())
+#test((1, 2, 3).windows(5), ())
+#test((1, 2, 3, 4, 5).windows(3), ((1, 2, 3), (2, 3, 4), (3, 4, 5)))
+#test((1, 2, 3, 4, 5, 6, 7, 8).windows(5), ((1, 2, 3, 4, 5), (2, 3, 4, 5, 6), (3, 4, 5, 6, 7), (4, 5, 6, 7, 8)))
+
+--- array-windows-size-zero ---
+// Error: 20-21 number must be positive
+#(1, 2, 3).windows(0)
+
+--- array-windows-size-negative ---
+// Error: 20-22 number must be positive
+#(1, 2, 3).windows(-5)
+
 --- array-sorted ---
 // Test the `sorted` method.
 #test(().sorted(), ())
@@ -350,6 +366,7 @@
 #test((1,).zip(()), ())
 #test((1,).zip((2,)), ((1, 2),))
 #test((1, 2).zip((3, 4)), ((1, 3), (2, 4)))
+#test((1, 2).zip((3, 4), exact: true), ((1, 3), (2, 4)))
 #test((1, 2, 3, 4).zip((5, 6)), ((1, 5), (2, 6)))
 #test(((1, 2), 3).zip((4, 5)), (((1, 2), 4), (3, 5)))
 #test((1, "hi").zip((true, false)), ((1, true), ("hi", false)))
@@ -358,6 +375,15 @@
 #test((1,).zip((2,), (3,)), ((1, 2, 3),))
 #test((1, 2, 3).zip(), ((1,), (2,), (3,)))
 #test(array.zip(()), ())
+
+--- array-zip-exact-error ---
+// Error: 13-22 second array has different length (3) from first array (2)
+#(1, 2).zip((1, 2, 3), exact: true)
+
+--- array-zip-exact-multi-error ---
+// Error: 13-22 array has different length (3) from first array (2)
+// Error: 24-36 array has different length (4) from first array (2)
+#(1, 2).zip((1, 2, 3), (1, 2, 3, 4), exact: true)
 
 --- array-enumerate ---
 // Test the `enumerate` method.
@@ -470,3 +496,16 @@
 --- array-unclosed ---
 // Error: 3-4 unclosed delimiter
 #{(}
+
+--- array-reduce ---
+// Test the `reduce` method.
+#test(().reduce(grid), none)
+#test((1, 2, 3, 4).reduce((s, x) => s + x), 10)
+
+--- array-reduce-missing-reducer ---
+// Error: 2-13 missing argument: reducer
+#().reduce()
+
+--- array-reduce-unexpected-argument ---
+// Error: 19-21 unexpected argument
+#(1, 2, 3).reduce(() => none)
