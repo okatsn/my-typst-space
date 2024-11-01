@@ -34,7 +34,7 @@ testit page stack
 
 Running a test with the exact test name `math-attach-mixed`.
 ```bash
-testit --exact math-attach-mixed
+testit --exact page.typ
 ```
 
 To make the integration tests go faster they don't generate PDFs by default.

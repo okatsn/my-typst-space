@@ -1,5 +1,3 @@
-# docker build -t okatsn/my-typst-space:latest .
-# docker push okatsn/my-typst-space:latest
 ARG CREATED
 ARG REVISION
 ARG TARGETPLATFORM
