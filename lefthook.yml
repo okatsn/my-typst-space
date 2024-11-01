@@ -1,8 +1,8 @@
 pre-commit:
   commands:
     dockerbuild5:
-      glob:   "typst-official-build/Dockerfile"
-      run: . ./typst-official-build/docker_build_and_push.sh
+      glob:   "Dockerfile"
+      run: . ./docker_build_and_push.sh
     testing:
       run: echo "Hello these are all {staged_files}"
 
