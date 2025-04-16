@@ -1,15 +1,26 @@
-echo "Dockerfile modified. Building and pushing Docker image..."
+#!/bin/bash
 
-docker build imgtyp .
+set -e
 
-docker tag imgtyp okatsn/my-typst-space:latest
+IMAGE_NAME="okatsn/my-typst-space"
 
-docker push okatsn/my-typst-space:latest
+if [ "$#" -eq 0 ]; then
+  echo "Usage: $0 docker_build_and_push.sh <tag1> [tag2 ...]"
+  sleep 5
+  exit 1
+fi
 
-# Push the same image with the other tag:
+TAGS=("$@")
 
-# docker tag okatsn/my-typst-space okatsn/my-typst-space:v2025a
-# docker push okatsn/my-typst-space:v2025a
+echo "Building Docker image with tag: $IMAGE_NAME:${TAGS[0]}"
+docker build -t "$IMAGE_NAME:latest" .
 
+for TAG in "${TAGS[@]}"; do
+  echo "Tagging image as: $IMAGE_NAME:$TAG"
+  docker tag "$IMAGE_NAME:latest" "$IMAGE_NAME:$TAG"
 
-echo "Docker image built and pushed successfully."
+  echo "Pushing Docker image: $IMAGE_NAME:$TAG"
+  docker push "$IMAGE_NAME:$TAG"
+done
+
+echo "Docker image built and pushed successfully for tags: ${TAGS[*]}"
