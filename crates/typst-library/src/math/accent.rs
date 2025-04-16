@@ -1,8 +1,7 @@
 use crate::diag::bail;
-use crate::foundations::{cast, elem, func, Content, NativeElement, Smart, Value};
+use crate::foundations::{cast, elem, func, Content, NativeElement, SymbolElem};
 use crate::layout::{Length, Rel};
 use crate::math::Mathy;
-use crate::text::TextElem;
 
 /// Attaches an accent to a base.
 ///
@@ -14,8 +13,8 @@ use crate::text::TextElem;
 /// ```
 #[elem(Mathy)]
 pub struct AccentElem {
-    /// The base to which the accent is applied.
-    /// May consist of multiple letters.
+    /// The base to which the accent is applied. May consist of multiple
+    /// letters.
     ///
     /// ```example
     /// $arrow(A B C)$
@@ -52,7 +51,24 @@ pub struct AccentElem {
     pub accent: Accent,
 
     /// The size of the accent, relative to the width of the base.
-    pub size: Smart<Rel<Length>>,
+    ///
+    /// ```example
+    /// $dash(A, size: #150%)$
+    /// ```
+    #[resolve]
+    #[default(Rel::one())]
+    pub size: Rel<Length>,
+
+    /// Whether to remove the dot on top of lowercase i and j when adding a top
+    /// accent.
+    ///
+    /// This enables the `dtls` OpenType feature.
+    ///
+    /// ```example
+    /// $hat(dotless: #false, i)$
+    /// ```
+    #[default(true)]
+    pub dotless: bool,
 }
 
 /// An accent character.
@@ -101,11 +117,18 @@ macro_rules! accents {
                 base: Content,
                 /// The size of the accent, relative to the width of the base.
                 #[named]
-                size: Option<Smart<Rel<Length>>>,
+                size: Option<Rel<Length>>,
+                /// Whether to remove the dot on top of lowercase i and j when
+                /// adding a top accent.
+                #[named]
+                dotless: Option<bool>,
             ) -> Content {
                 let mut accent = AccentElem::new(base, Accent::new($primary));
                 if let Some(size) = size {
                     accent = accent.with_size(size);
+                }
+                if let Some(dotless) = dotless {
+                    accent = accent.with_dotless(dotless);
                 }
                 accent.pack()
             }
@@ -140,8 +163,8 @@ cast! {
     Accent,
     self => self.0.into_value(),
     v: char => Self::new(v),
-    v: Content => match v.to_packed::<TextElem>() {
-        Some(elem) => Value::Str(elem.text().clone().into()).cast()?,
-        None => bail!("expected text"),
+    v: Content => match v.to_packed::<SymbolElem>() {
+        Some(elem) => Self::new(elem.text),
+        None => bail!("expected a symbol"),
     },
 }

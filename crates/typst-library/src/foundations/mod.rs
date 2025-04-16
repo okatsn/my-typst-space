@@ -25,12 +25,15 @@ mod int;
 mod label;
 mod module;
 mod none;
-mod plugin;
+#[path = "plugin.rs"]
+mod plugin_;
 mod scope;
 mod selector;
 mod str;
 mod styles;
 mod symbol;
+#[path = "target.rs"]
+mod target_;
 mod ty;
 mod value;
 mod version;
@@ -54,13 +57,14 @@ pub use self::int::*;
 pub use self::label::*;
 pub use self::module::*;
 pub use self::none::*;
-pub use self::plugin::*;
+pub use self::plugin_::*;
 pub use self::repr::Repr;
 pub use self::scope::*;
 pub use self::selector::*;
 pub use self::str::*;
 pub use self::styles::*;
 pub use self::symbol::*;
+pub use self::target_::*;
 pub use self::ty::*;
 pub use self::value::*;
 pub use self::version::*;
@@ -73,23 +77,18 @@ pub use {
     indexmap::IndexMap,
 };
 
+use comemo::TrackedMut;
 use ecow::EcoString;
 use typst_syntax::Spanned;
 
 use crate::diag::{bail, SourceResult, StrResult};
 use crate::engine::Engine;
 use crate::routines::EvalMode;
-
-/// Foundational types and functions.
-///
-/// Here, you'll find documentation for basic data types like [integers]($int)
-/// and [strings]($str) as well as details about core computational functions.
-#[category]
-pub static FOUNDATIONS: Category;
+use crate::{Feature, Features};
 
 /// Hook up all `foundations` definitions.
-pub(super) fn define(global: &mut Scope, inputs: Dict) {
-    global.category(FOUNDATIONS);
+pub(super) fn define(global: &mut Scope, inputs: Dict, features: &Features) {
+    global.start_category(crate::Category::Foundations);
     global.define_type::<bool>();
     global.define_type::<i64>();
     global.define_type::<f64>();
@@ -110,14 +109,17 @@ pub(super) fn define(global: &mut Scope, inputs: Dict) {
     global.define_type::<Symbol>();
     global.define_type::<Duration>();
     global.define_type::<Version>();
-    global.define_type::<Plugin>();
     global.define_func::<repr::repr>();
     global.define_func::<panic>();
     global.define_func::<assert>();
     global.define_func::<eval>();
-    global.define_func::<style>();
-    global.define_module(calc::module());
-    global.define_module(sys::module(inputs));
+    global.define_func::<plugin>();
+    if features.is_enabled(Feature::Html) {
+        global.define_func::<target>();
+    }
+    global.define("calc", calc::module());
+    global.define("sys", sys::module(inputs));
+    global.reset_category();
 }
 
 /// Fails with an error.
@@ -260,7 +262,6 @@ impl assert {
 /// ```
 #[func(title = "Evaluate")]
 pub fn eval(
-    /// The engine.
     engine: &mut Engine,
     /// A string of Typst code to evaluate.
     source: Spanned<String>,
@@ -295,7 +296,16 @@ pub fn eval(
     let dict = scope;
     let mut scope = Scope::new();
     for (key, value) in dict {
-        scope.define_spanned(key, value, span);
+        scope.bind(key.into(), Binding::new(value, span));
     }
-    (engine.routines.eval_string)(engine.routines, engine.world, &text, span, mode, scope)
+
+    (engine.routines.eval_string)(
+        engine.routines,
+        engine.world,
+        TrackedMut::reborrow_mut(&mut engine.sink),
+        &text,
+        span,
+        mode,
+        scope,
+    )
 }

@@ -3,9 +3,10 @@ use ecow::{eco_format, eco_vec, EcoString};
 use typst_library::diag::{
     bail, error, warning, At, FileError, SourceResult, Trace, Tracepoint,
 };
-use typst_library::foundations::{Content, Module, Value};
+use typst_library::engine::Engine;
+use typst_library::foundations::{Binding, Content, Module, Value};
 use typst_library::World;
-use typst_syntax::ast::{self, AstNode};
+use typst_syntax::ast::{self, AstNode, BareImportError};
 use typst_syntax::package::{PackageManifest, PackageSpec};
 use typst_syntax::{FileId, Span, VirtualPath};
 
@@ -15,11 +16,11 @@ impl Eval for ast::ModuleImport<'_> {
     type Output = Value;
 
     fn eval(self, vm: &mut Vm) -> SourceResult<Self::Output> {
-        let source = self.source();
-        let source_span = source.span();
-        let mut source = source.eval(vm)?;
-        let new_name = self.new_name();
-        let imports = self.imports();
+        let source_expr = self.source();
+        let source_span = source_expr.span();
+
+        let mut source = source_expr.eval(vm)?;
+        let mut is_str = false;
 
         match &source {
             Value::Func(func) => {
@@ -28,11 +29,22 @@ impl Eval for ast::ModuleImport<'_> {
                 }
             }
             Value::Type(_) => {}
-            other => {
-                source = Value::Module(import(vm, other.clone(), source_span, true)?);
+            Value::Module(_) => {}
+            Value::Str(path) => {
+                source = Value::Module(import(&mut vm.engine, path, source_span)?);
+                is_str = true;
+            }
+            v => {
+                bail!(
+                    source_span,
+                    "expected path, module, function, or type, found {}",
+                    v.ty()
+                )
             }
         }
 
+        // If there is a rename, import the source itself under that name.
+        let new_name = self.new_name();
         if let Some(new_name) = new_name {
             if let ast::Expr::Ident(ident) = self.source() {
                 if ident.as_str() == new_name.as_str() {
@@ -45,21 +57,42 @@ impl Eval for ast::ModuleImport<'_> {
             }
 
             // Define renamed module on the scope.
-            vm.scopes.top.define_ident(new_name, source.clone());
+            vm.define(new_name, source.clone());
         }
 
         let scope = source.scope().unwrap();
-        match imports {
+        match self.imports() {
             None => {
-                // Only import here if there is no rename.
                 if new_name.is_none() {
-                    let name: EcoString = source.name().unwrap().into();
-                    vm.scopes.top.define(name, source);
+                    match self.bare_name() {
+                        // Bare dynamic string imports are not allowed.
+                        Ok(name)
+                            if !is_str || matches!(source_expr, ast::Expr::Str(_)) =>
+                        {
+                            if matches!(source_expr, ast::Expr::Ident(_)) {
+                                vm.engine.sink.warn(warning!(
+                                    source_expr.span(),
+                                    "this import has no effect",
+                                ));
+                            }
+                            vm.scopes.top.bind(name, Binding::new(source, source_span));
+                        }
+                        Ok(_) | Err(BareImportError::Dynamic) => bail!(
+                            source_span, "dynamic import requires an explicit name";
+                            hint: "you can name the import with `as`"
+                        ),
+                        Err(BareImportError::PathInvalid) => bail!(
+                            source_span, "module name would not be a valid identifier";
+                            hint: "you can rename the import with `as`",
+                        ),
+                        // Bad package spec would have failed the import already.
+                        Err(BareImportError::PackageInvalid) => unreachable!(),
+                    }
                 }
             }
             Some(ast::Imports::Wildcard) => {
-                for (var, value, span) in scope.iter() {
-                    vm.scopes.top.define_spanned(var.clone(), value.clone(), span);
+                for (var, binding) in scope.iter() {
+                    vm.scopes.top.bind(var.clone(), binding.clone());
                 }
             }
             Some(ast::Imports::Items(items)) => {
@@ -69,7 +102,7 @@ impl Eval for ast::ModuleImport<'_> {
                     let mut scope = scope;
 
                     while let Some(component) = &path.next() {
-                        let Some(value) = scope.get(component) else {
+                        let Some(binding) = scope.get(component) else {
                             errors.push(error!(component.span(), "unresolved import"));
                             break;
                         };
@@ -77,6 +110,7 @@ impl Eval for ast::ModuleImport<'_> {
                         if path.peek().is_some() {
                             // Nested import, as this is not the last component.
                             // This must be a submodule.
+                            let value = binding.read();
                             let Some(submodule) = value.scope() else {
                                 let error = if matches!(value, Value::Func(function) if function.scope().is_none())
                                 {
@@ -119,7 +153,7 @@ impl Eval for ast::ModuleImport<'_> {
                                 }
                             }
 
-                            vm.define(item.bound_name(), value.clone());
+                            vm.bind(item.bound_name(), binding.clone());
                         }
                     }
                 }
@@ -139,92 +173,75 @@ impl Eval for ast::ModuleInclude<'_> {
     fn eval(self, vm: &mut Vm) -> SourceResult<Self::Output> {
         let span = self.source().span();
         let source = self.source().eval(vm)?;
-        let module = import(vm, source, span, false)?;
+        let module = match source {
+            Value::Str(path) => import(&mut vm.engine, &path, span)?,
+            Value::Module(module) => module,
+            v => bail!(span, "expected path or module, found {}", v.ty()),
+        };
         Ok(module.content())
     }
 }
 
-/// Process an import of a module relative to the current location.
-pub fn import(
-    vm: &mut Vm,
-    source: Value,
-    span: Span,
-    allow_scopes: bool,
-) -> SourceResult<Module> {
-    let path = match source {
-        Value::Str(path) => path,
-        Value::Module(module) => return Ok(module),
-        v if allow_scopes => {
-            bail!(span, "expected path, module, function, or type, found {}", v.ty())
-        }
-        v => bail!(span, "expected path or module, found {}", v.ty()),
-    };
-
-    // Handle package and file imports.
-    let path = path.as_str();
-    if path.starts_with('@') {
-        let spec = path.parse::<PackageSpec>().at(span)?;
-        import_package(vm, spec, span)
+/// Process an import of a package or file relative to the current location.
+pub fn import(engine: &mut Engine, from: &str, span: Span) -> SourceResult<Module> {
+    if from.starts_with('@') {
+        let spec = from.parse::<PackageSpec>().at(span)?;
+        import_package(engine, spec, span)
     } else {
-        import_file(vm, path, span)
+        let id = span.resolve_path(from).at(span)?;
+        import_file(engine, id, span)
     }
 }
 
-/// Import an external package.
-fn import_package(vm: &mut Vm, spec: PackageSpec, span: Span) -> SourceResult<Module> {
-    // Evaluate the manifest.
-    let world = vm.world();
-    let manifest_id = FileId::new(Some(spec.clone()), VirtualPath::new("typst.toml"));
-    let bytes = world.file(manifest_id).at(span)?;
-    let string = std::str::from_utf8(&bytes).map_err(FileError::from).at(span)?;
-    let manifest: PackageManifest = toml::from_str(string)
-        .map_err(|err| eco_format!("package manifest is malformed ({})", err.message()))
-        .at(span)?;
-    manifest.validate(&spec).at(span)?;
-
-    // Evaluate the entry point.
-    let entrypoint_id = manifest_id.join(&manifest.package.entrypoint);
-    let source = world.source(entrypoint_id).at(span)?;
-
-    // Prevent cyclic importing.
-    if vm.engine.route.contains(source.id()) {
-        bail!(span, "cyclic import");
-    }
-
-    let point = || Tracepoint::Import;
-    Ok(eval(
-        vm.engine.routines,
-        vm.engine.world,
-        vm.engine.traced,
-        TrackedMut::reborrow_mut(&mut vm.engine.sink),
-        vm.engine.route.track(),
-        &source,
-    )
-    .trace(world, point, span)?
-    .with_name(manifest.package.name))
-}
-
-/// Import a file from a path.
-fn import_file(vm: &mut Vm, path: &str, span: Span) -> SourceResult<Module> {
+/// Import a file from a path. The path is resolved relative to the given
+/// `span`.
+fn import_file(engine: &mut Engine, id: FileId, span: Span) -> SourceResult<Module> {
     // Load the source file.
-    let world = vm.world();
-    let id = span.resolve_path(path).at(span)?;
-    let source = world.source(id).at(span)?;
+    let source = engine.world.source(id).at(span)?;
 
     // Prevent cyclic importing.
-    if vm.engine.route.contains(source.id()) {
+    if engine.route.contains(source.id()) {
         bail!(span, "cyclic import");
     }
 
     // Evaluate the file.
     let point = || Tracepoint::Import;
     eval(
-        vm.engine.routines,
-        vm.engine.world,
-        vm.engine.traced,
-        TrackedMut::reborrow_mut(&mut vm.engine.sink),
-        vm.engine.route.track(),
+        engine.routines,
+        engine.world,
+        engine.traced,
+        TrackedMut::reborrow_mut(&mut engine.sink),
+        engine.route.track(),
         &source,
     )
-    .trace(world, point, span)
+    .trace(engine.world, point, span)
+}
+
+/// Import an external package.
+fn import_package(
+    engine: &mut Engine,
+    spec: PackageSpec,
+    span: Span,
+) -> SourceResult<Module> {
+    let (name, id) = resolve_package(engine, spec, span)?;
+    import_file(engine, id, span).map(|module| module.with_name(name))
+}
+
+/// Resolve the name and entrypoint of a package.
+fn resolve_package(
+    engine: &mut Engine,
+    spec: PackageSpec,
+    span: Span,
+) -> SourceResult<(EcoString, FileId)> {
+    // Evaluate the manifest.
+    let manifest_id = FileId::new(Some(spec.clone()), VirtualPath::new("typst.toml"));
+    let bytes = engine.world.file(manifest_id).at(span)?;
+    let string = bytes.as_str().map_err(FileError::from).at(span)?;
+    let manifest: PackageManifest = toml::from_str(string)
+        .map_err(|err| eco_format!("package manifest is malformed ({})", err.message()))
+        .at(span)?;
+    manifest.validate(&spec).at(span)?;
+
+    // Evaluate the entry point.
+    Ok((manifest.package.name, manifest_id.join(&manifest.package.entrypoint)))
 }

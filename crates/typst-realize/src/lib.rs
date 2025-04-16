@@ -15,9 +15,10 @@ use typst_library::diag::{bail, At, SourceResult};
 use typst_library::engine::Engine;
 use typst_library::foundations::{
     Content, Context, ContextElem, Element, NativeElement, Recipe, RecipeIndex, Selector,
-    SequenceElem, Show, ShowSet, Style, StyleChain, StyleVec, StyledElem, Styles,
+    SequenceElem, Show, ShowSet, Style, StyleChain, StyledElem, Styles, SymbolElem,
     Synthesize, Transformation,
 };
+use typst_library::html::{tag, HtmlElem};
 use typst_library::introspection::{Locatable, SplitLocator, Tag, TagElem};
 use typst_library::layout::{
     AlignElem, BoxElem, HElem, InlineElem, PageElem, PagebreakElem, VElem,
@@ -27,7 +28,7 @@ use typst_library::model::{
     CiteElem, CiteGroup, DocumentElem, EnumElem, ListElem, ListItemLike, ListLike,
     ParElem, ParbreakElem, TermsElem,
 };
-use typst_library::routines::{Arenas, Pair, RealizationKind};
+use typst_library::routines::{Arenas, FragmentKind, Pair, RealizationKind};
 use typst_library::text::{LinebreakElem, SmartQuoteElem, SpaceElem, TextElem};
 use typst_syntax::Span;
 use typst_utils::{SliceExt, SmallBitSet};
@@ -47,13 +48,18 @@ pub fn realize<'a>(
         locator,
         arenas,
         rules: match kind {
-            RealizationKind::Root(_) | RealizationKind::Container => NORMAL_RULES,
+            RealizationKind::LayoutDocument(_) => LAYOUT_RULES,
+            RealizationKind::LayoutFragment(_) => LAYOUT_RULES,
+            RealizationKind::LayoutPar => LAYOUT_PAR_RULES,
+            RealizationKind::HtmlDocument(_) => HTML_DOCUMENT_RULES,
+            RealizationKind::HtmlFragment(_) => HTML_FRAGMENT_RULES,
             RealizationKind::Math => MATH_RULES,
         },
         sink: vec![],
         groupings: ArrayVec::new(),
-        outside: matches!(kind, RealizationKind::Root(_)),
+        outside: matches!(kind, RealizationKind::LayoutDocument(_)),
         may_attach: false,
+        saw_parbreak: false,
         kind,
     };
 
@@ -93,6 +99,8 @@ struct State<'a, 'x, 'y, 'z> {
     outside: bool,
     /// Whether now following attach spacing can survive.
     may_attach: bool,
+    /// Whether we visited any paragraph breaks.
+    saw_parbreak: bool,
 }
 
 /// Defines a rule for how certain elements shall be grouped during realization.
@@ -105,10 +113,10 @@ struct GroupingRule {
     /// be visible to `finish`.
     tags: bool,
     /// Defines which kinds of elements start and make up this kind of grouping.
-    trigger: fn(Element) -> bool,
+    trigger: fn(&Content, &RealizationKind) -> bool,
     /// Defines elements that may appear in the interior of the grouping, but
     /// not at the edges.
-    inner: fn(Element) -> bool,
+    inner: fn(&Content) -> bool,
     /// Defines whether styles for this kind of element interrupt the grouping.
     interrupt: fn(Element) -> bool,
     /// Should convert the accumulated elements in `s.sink[start..]` into
@@ -120,6 +128,10 @@ struct GroupingRule {
 struct Grouping<'a> {
     /// The position in `s.sink` where the group starts.
     start: usize,
+    /// Only applies to `PAR` grouping: Whether this paragraph group is
+    /// interrupted, but not yet finished because it may be ignored due to being
+    /// fully inline.
+    interrupted: bool,
     /// The rule used for this grouping.
     rule: &'a GroupingRule,
 }
@@ -236,7 +248,7 @@ fn visit<'a>(
         return Ok(());
     }
 
-    // Recurse into sequences.  Styled elements and sequences can currently also
+    // Recurse into sequences. Styled elements and sequences can currently also
     // have labels, so this needs to happen before they are handled.
     if let Some(sequence) = content.to_packed::<SequenceElem>() {
         for elem in &sequence.children {
@@ -290,7 +302,14 @@ fn visit_math_rules<'a>(
         // In normal realization, we apply regex show rules to consecutive
         // textual elements via `TEXTUAL` grouping. However, in math, this is
         // not desirable, so we just do it on a per-element basis.
-        if let Some(elem) = content.to_packed::<TextElem>() {
+        if let Some(elem) = content.to_packed::<SymbolElem>() {
+            if let Some(m) =
+                find_regex_match_in_str(elem.text.encode_utf8(&mut [0; 4]), styles)
+            {
+                visit_regex_match(s, &[(content, styles)], m)?;
+                return Ok(true);
+            }
+        } else if let Some(elem) = content.to_packed::<TextElem>() {
             if let Some(m) = find_regex_match_in_str(&elem.text, styles) {
                 visit_regex_match(s, &[(content, styles)], m)?;
                 return Ok(true);
@@ -301,6 +320,17 @@ fn visit_math_rules<'a>(
         if content.can::<dyn Mathy>() && !content.is::<EquationElem>() {
             let eq = EquationElem::new(content.clone()).pack().spanned(content.span());
             visit(s, s.store(eq), styles)?;
+            return Ok(true);
+        }
+
+        // Symbols in non-math content transparently convert to `TextElem` so we
+        // don't have to handle them in non-math layout.
+        if let Some(elem) = content.to_packed::<SymbolElem>() {
+            let mut text = TextElem::packed(elem.text).spanned(elem.span());
+            if let Some(label) = elem.label() {
+                text.set_label(label);
+            }
+            visit(s, s.store(text), styles)?;
             return Ok(true);
         }
     }
@@ -555,17 +585,21 @@ fn visit_styled<'a>(
     for style in local.iter() {
         let Some(elem) = style.element() else { continue };
         if elem == DocumentElem::elem() {
-            let RealizationKind::Root(info) = &mut s.kind else {
-                let span = style.span();
-                bail!(span, "document set rules are not allowed inside of containers");
-            };
-
-            info.populate(&local);
+            if let Some(info) = s.kind.as_document_mut() {
+                info.populate(&local)
+            } else {
+                bail!(
+                    style.span(),
+                    "document set rules are not allowed inside of containers"
+                );
+            }
         } else if elem == PageElem::elem() {
-            let RealizationKind::Root(_) = s.kind else {
-                let span = style.span();
-                bail!(span, "page configuration is not allowed inside of containers");
-            };
+            if !matches!(s.kind, RealizationKind::LayoutDocument(_)) {
+                bail!(
+                    style.span(),
+                    "page configuration is not allowed inside of containers"
+                );
+            }
 
             // When there are page styles, we "break free" from our show rule cage.
             pagebreak = true;
@@ -618,8 +652,7 @@ fn visit_grouping_rules<'a>(
     content: &'a Content,
     styles: StyleChain<'a>,
 ) -> SourceResult<bool> {
-    let elem = content.elem();
-    let matching = s.rules.iter().find(|&rule| (rule.trigger)(elem));
+    let matching = s.rules.iter().find(|&rule| (rule.trigger)(content, &s.kind));
 
     // Try to continue or finish an existing grouping.
     while let Some(active) = s.groupings.last() {
@@ -629,7 +662,9 @@ fn visit_grouping_rules<'a>(
         }
 
         // If the element can be added to the active grouping, do it.
-        if (active.rule.trigger)(elem) || (active.rule.inner)(elem) {
+        if !active.interrupted
+            && ((active.rule.trigger)(content, &s.kind) || (active.rule.inner)(content))
+        {
             s.sink.push((content, styles));
             return Ok(true);
         }
@@ -640,7 +675,7 @@ fn visit_grouping_rules<'a>(
     // Start a new grouping.
     if let Some(rule) = matching {
         let start = s.sink.len();
-        s.groupings.push(Grouping { start, rule });
+        s.groupings.push(Grouping { start, rule, interrupted: false });
         s.sink.push((content, styles));
         return Ok(true);
     }
@@ -655,20 +690,24 @@ fn visit_filter_rules<'a>(
     content: &'a Content,
     styles: StyleChain<'a>,
 ) -> SourceResult<bool> {
-    if content.is::<SpaceElem>() && !matches!(s.kind, RealizationKind::Math) {
-        // Outside of maths, spaces that were not collected by the paragraph
-        // grouper don't interest us.
+    if matches!(s.kind, RealizationKind::LayoutPar | RealizationKind::Math) {
+        return Ok(false);
+    }
+
+    if content.is::<SpaceElem>() {
+        // Outside of maths and paragraph realization, spaces that were not
+        // collected by the paragraph grouper don't interest us.
         return Ok(true);
     } else if content.is::<ParbreakElem>() {
         // Paragraph breaks are only a boundary for paragraph grouping, we don't
         // need to store them.
         s.may_attach = false;
+        s.saw_parbreak = true;
         return Ok(true);
     } else if !s.may_attach
         && content.to_packed::<VElem>().is_some_and(|elem| elem.attach(styles))
     {
-        // Delete attach spacing collapses if not immediately following a
-        // paragraph.
+        // Attach spacing collapses if not immediately following a paragraph.
         return Ok(true);
     }
 
@@ -680,10 +719,21 @@ fn visit_filter_rules<'a>(
 
 /// Finishes all grouping.
 fn finish(s: &mut State) -> SourceResult<()> {
-    finish_grouping_while(s, |s| !s.groupings.is_empty())?;
+    finish_grouping_while(s, |s| {
+        // If this is a fragment realization and all we've got is inline
+        // content, don't turn it into a paragraph.
+        if is_fully_inline(s) {
+            *s.kind.as_fragment_mut().unwrap() = FragmentKind::Inline;
+            s.groupings.pop();
+            collapse_spaces(&mut s.sink, 0);
+            false
+        } else {
+            !s.groupings.is_empty()
+        }
+    })?;
 
-    // In math, spaces are top-level.
-    if let RealizationKind::Math = s.kind {
+    // In paragraph and math realization, spaces are top-level.
+    if matches!(s.kind, RealizationKind::LayoutPar | RealizationKind::Math) {
         collapse_spaces(&mut s.sink, 0);
     }
 
@@ -699,6 +749,12 @@ fn finish_interrupted(s: &mut State, local: &Styles) -> SourceResult<()> {
         }
         finish_grouping_while(s, |s| {
             s.groupings.iter().any(|grouping| (grouping.rule.interrupt)(elem))
+                && if is_fully_inline(s) {
+                    s.groupings[0].interrupted = true;
+                    false
+                } else {
+                    true
+                }
         })?;
         last = Some(elem);
     }
@@ -706,9 +762,9 @@ fn finish_interrupted(s: &mut State, local: &Styles) -> SourceResult<()> {
 }
 
 /// Finishes groupings while `f` returns `true`.
-fn finish_grouping_while<F>(s: &mut State, f: F) -> SourceResult<()>
+fn finish_grouping_while<F>(s: &mut State, mut f: F) -> SourceResult<()>
 where
-    F: Fn(&State) -> bool,
+    F: FnMut(&mut State) -> bool,
 {
     // Finishing of a group may result in new content and new grouping. This
     // can, in theory, go on for a bit. To prevent it from becoming an infinite
@@ -727,10 +783,10 @@ where
 /// Finishes the currently innermost grouping.
 fn finish_innermost_grouping(s: &mut State) -> SourceResult<()> {
     // The grouping we are interrupting.
-    let Grouping { start, rule } = s.groupings.pop().unwrap();
+    let Grouping { start, rule, .. } = s.groupings.pop().unwrap();
 
     // Trim trailing non-trigger elements.
-    let trimmed = s.sink[start..].trim_end_matches(|(c, _)| !(rule.trigger)(c.elem()));
+    let trimmed = s.sink[start..].trim_end_matches(|(c, _)| !(rule.trigger)(c, &s.kind));
     let end = start + trimmed.len();
     let tail = s.store_slice(&s.sink[end..]);
     s.sink.truncate(end);
@@ -768,8 +824,19 @@ fn finish_innermost_grouping(s: &mut State) -> SourceResult<()> {
 /// number of unique priority levels.
 const MAX_GROUP_NESTING: usize = 3;
 
-/// Grouping rules used in normal realizations.
-static NORMAL_RULES: &[&GroupingRule] = &[&TEXTUAL, &PAR, &CITES, &LIST, &ENUM, &TERMS];
+/// Grouping rules used in layout realization.
+static LAYOUT_RULES: &[&GroupingRule] = &[&TEXTUAL, &PAR, &CITES, &LIST, &ENUM, &TERMS];
+
+/// Grouping rules used in paragraph layout realization.
+static LAYOUT_PAR_RULES: &[&GroupingRule] = &[&TEXTUAL, &CITES, &LIST, &ENUM, &TERMS];
+
+/// Grouping rules used in HTML root realization.
+static HTML_DOCUMENT_RULES: &[&GroupingRule] =
+    &[&TEXTUAL, &PAR, &CITES, &LIST, &ENUM, &TERMS];
+
+/// Grouping rules used in HTML fragment realization.
+static HTML_FRAGMENT_RULES: &[&GroupingRule] =
+    &[&TEXTUAL, &PAR, &CITES, &LIST, &ENUM, &TERMS];
 
 /// Grouping rules used in math realization.
 static MATH_RULES: &[&GroupingRule] = &[&CITES, &LIST, &ENUM, &TERMS];
@@ -778,12 +845,16 @@ static MATH_RULES: &[&GroupingRule] = &[&CITES, &LIST, &ENUM, &TERMS];
 static TEXTUAL: GroupingRule = GroupingRule {
     priority: 3,
     tags: true,
-    trigger: |elem| {
+    trigger: |content, _| {
+        let elem = content.elem();
+        // Note that `SymbolElem` converts into `TextElem` before textual show
+        // rules run, and we apply textual rules to elements manually during
+        // math realization, so we don't check for it here.
         elem == TextElem::elem()
             || elem == LinebreakElem::elem()
             || elem == SmartQuoteElem::elem()
     },
-    inner: |elem| elem == SpaceElem::elem(),
+    inner: |content| content.elem() == SpaceElem::elem(),
     // Any kind of style interrupts this kind of grouping since regex show
     // rules cannot match over style changes anyway.
     interrupt: |_| true,
@@ -794,15 +865,20 @@ static TEXTUAL: GroupingRule = GroupingRule {
 static PAR: GroupingRule = GroupingRule {
     priority: 1,
     tags: true,
-    trigger: |elem| {
+    trigger: |content, kind| {
+        let elem = content.elem();
         elem == TextElem::elem()
             || elem == HElem::elem()
             || elem == LinebreakElem::elem()
             || elem == SmartQuoteElem::elem()
             || elem == InlineElem::elem()
             || elem == BoxElem::elem()
+            || (kind.is_html()
+                && content
+                    .to_packed::<HtmlElem>()
+                    .is_some_and(|elem| tag::is_inline_by_default(elem.tag)))
     },
-    inner: |elem| elem == SpaceElem::elem(),
+    inner: |content| content.elem() == SpaceElem::elem(),
     interrupt: |elem| elem == ParElem::elem() || elem == AlignElem::elem(),
     finish: finish_par,
 };
@@ -811,9 +887,11 @@ static PAR: GroupingRule = GroupingRule {
 static CITES: GroupingRule = GroupingRule {
     priority: 2,
     tags: false,
-    trigger: |elem| elem == CiteElem::elem(),
-    inner: |elem| elem == SpaceElem::elem(),
-    interrupt: |elem| elem == CiteGroup::elem(),
+    trigger: |content, _| content.elem() == CiteElem::elem(),
+    inner: |content| content.elem() == SpaceElem::elem(),
+    interrupt: |elem| {
+        elem == CiteGroup::elem() || elem == ParElem::elem() || elem == AlignElem::elem()
+    },
     finish: finish_cites,
 };
 
@@ -831,9 +909,12 @@ const fn list_like_grouping<T: ListLike>() -> GroupingRule {
     GroupingRule {
         priority: 2,
         tags: false,
-        trigger: |elem| elem == T::Item::elem(),
-        inner: |elem| elem == SpaceElem::elem() || elem == ParbreakElem::elem(),
-        interrupt: |elem| elem == T::elem(),
+        trigger: |content, _| content.elem() == T::Item::elem(),
+        inner: |content| {
+            let elem = content.elem();
+            elem == SpaceElem::elem() || elem == ParbreakElem::elem()
+        },
+        interrupt: |elem| elem == T::elem() || elem == AlignElem::elem(),
         finish: finish_list_like::<T>,
     }
 }
@@ -867,18 +948,32 @@ fn finish_textual(Grouped { s, mut start }: Grouped) -> SourceResult<()> {
     // 1. We are already in a paragraph group. In this case, the elements just
     //    transparently become part of it.
     // 2. There is no group at all. In this case, we create one.
-    if s.groupings.is_empty() {
-        s.groupings.push(Grouping { start, rule: &PAR });
+    if s.groupings.is_empty() && s.rules.iter().any(|&rule| std::ptr::eq(rule, &PAR)) {
+        s.groupings.push(Grouping { start, rule: &PAR, interrupted: false });
     }
 
     Ok(())
 }
 
 /// Whether there is an active grouping, but it is not a `PAR` grouping.
-fn in_non_par_grouping(s: &State) -> bool {
-    s.groupings
-        .last()
-        .is_some_and(|grouping| !std::ptr::eq(grouping.rule, &PAR))
+fn in_non_par_grouping(s: &mut State) -> bool {
+    s.groupings.last().is_some_and(|grouping| {
+        !std::ptr::eq(grouping.rule, &PAR) || grouping.interrupted
+    })
+}
+
+/// Whether there is exactly one active grouping, it is a `PAR` grouping, and it
+/// spans the whole sink (with the exception of leading tags).
+fn is_fully_inline(s: &State) -> bool {
+    s.kind.is_fragment()
+        && !s.saw_parbreak
+        && match s.groupings.as_slice() {
+            [grouping] => {
+                std::ptr::eq(grouping.rule, &PAR)
+                    && s.sink[..grouping.start].iter().all(|(c, _)| c.is::<TagElem>())
+            }
+            _ => false,
+        }
 }
 
 /// Builds the `ParElem` from inline-level elements.
@@ -890,11 +985,11 @@ fn finish_par(mut grouped: Grouped) -> SourceResult<()> {
     // Collect the children.
     let elems = grouped.get();
     let span = select_span(elems);
-    let (children, trunk) = StyleVec::create(elems);
+    let (body, trunk) = repack(elems);
 
     // Create and visit the paragraph.
     let s = grouped.end();
-    let elem = ParElem::new(children).pack().spanned(span);
+    let elem = ParElem::new(body).pack().spanned(span);
     visit(s, s.store(elem), trunk)
 }
 
@@ -1090,7 +1185,16 @@ fn visit_regex_match<'a>(
     m: RegexMatch<'a>,
 ) -> SourceResult<()> {
     let match_range = m.offset..m.offset + m.text.len();
-    let piece = TextElem::packed(m.text);
+
+    // Replace with the correct intuitive element kind: if matching against a
+    // lone symbol, return a `SymbolElem`, otherwise return a newly composed
+    // `TextElem`. We should only match against a `SymbolElem` during math
+    // realization (`RealizationKind::Math`).
+    let piece = match elems {
+        &[(lone, _)] if lone.is::<SymbolElem>() => lone.clone(),
+        _ => TextElem::packed(m.text),
+    };
+
     let context = Context::new(None, Some(m.styles));
     let output = m.recipe.apply(s.engine, context.track(), piece)?;
 
@@ -1113,10 +1217,16 @@ fn visit_regex_match<'a>(
             continue;
         }
 
-        // At this point, we can have a `TextElem`, `SpaceElem`,
+        // At this point, we can have a `TextElem`, `SymbolElem`, `SpaceElem`,
         // `LinebreakElem`, or `SmartQuoteElem`. We now determine the range of
         // the element.
-        let len = content.to_packed::<TextElem>().map_or(1, |elem| elem.text.len());
+        let len = if let Some(elem) = content.to_packed::<TextElem>() {
+            elem.text.len()
+        } else if let Some(elem) = content.to_packed::<SymbolElem>() {
+            elem.text.len_utf8()
+        } else {
+            1 // The rest are Ascii, so just one byte.
+        };
         let elem_range = cursor..cursor + len;
 
         // If the element starts before the start of match, visit it fully or
@@ -1215,4 +1325,27 @@ fn destruct_space(buf: &mut [Pair], end: &mut usize, state: &mut SpaceState) {
 /// Finds the first non-detached span in the list.
 fn select_span(children: &[Pair]) -> Span {
     Span::find(children.iter().map(|(c, _)| c.span()))
+}
+
+/// Turn realized content with styles back into owned content and a trunk style
+/// chain.
+fn repack<'a>(buf: &[Pair<'a>]) -> (Content, StyleChain<'a>) {
+    let trunk = StyleChain::trunk(buf.iter().map(|&(_, s)| s)).unwrap_or_default();
+    let depth = trunk.links().count();
+
+    let mut seq = Vec::with_capacity(buf.len());
+
+    for (chain, group) in buf.group_by_key(|&(_, s)| s) {
+        let iter = group.iter().map(|&(c, _)| c.clone());
+        let suffix = chain.suffix(depth);
+        if suffix.is_empty() {
+            seq.extend(iter);
+        } else if let &[(element, _)] = group {
+            seq.push(element.clone().styled_with_map(suffix));
+        } else {
+            seq.push(Content::sequence(iter).styled_with_map(suffix));
+        }
+    }
+
+    (Content::sequence(seq), trunk)
 }

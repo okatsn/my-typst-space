@@ -7,7 +7,7 @@ use smallvec::{smallvec, SmallVec};
 use typst_syntax::Span;
 use typst_utils::NonZeroExt;
 
-use crate::diag::{bail, warning, At, HintedStrResult, SourceResult};
+use crate::diag::{bail, At, HintedStrResult, SourceResult};
 use crate::engine::{Engine, Route, Sink, Traced};
 use crate::foundations::{
     cast, elem, func, scope, select_where, ty, Args, Array, Construct, Content, Context,
@@ -229,10 +229,10 @@ impl Counter {
         if self.is_page() {
             let at_delta =
                 engine.introspector.page(location).get().saturating_sub(at_page.get());
-            at_state.step(NonZeroUsize::ONE, at_delta);
+            at_state.step(NonZeroUsize::ONE, at_delta as u64);
             let final_delta =
                 engine.introspector.pages().get().saturating_sub(final_page.get());
-            final_state.step(NonZeroUsize::ONE, final_delta);
+            final_state.step(NonZeroUsize::ONE, final_delta as u64);
         }
         Ok(CounterState(smallvec![at_state.first(), final_state.first()]))
     }
@@ -250,7 +250,7 @@ impl Counter {
         if self.is_page() {
             let delta =
                 engine.introspector.page(location).get().saturating_sub(page.get());
-            state.step(NonZeroUsize::ONE, delta);
+            state.step(NonZeroUsize::ONE, delta as u64);
         }
         Ok(state)
     }
@@ -319,7 +319,7 @@ impl Counter {
 
                 let delta = page.get() - prev.get();
                 if delta > 0 {
-                    state.step(NonZeroUsize::ONE, delta);
+                    state.step(NonZeroUsize::ONE, delta as u64);
                 }
             }
 
@@ -353,7 +353,7 @@ impl Counter {
     }
 
     /// Shared implementation of displaying between `counter.display` and
-    /// `DisplayElem`, which will be deprecated.
+    /// `CounterDisplayElem`.
     fn display_impl(
         &self,
         engine: &mut Engine,
@@ -366,20 +366,22 @@ impl Counter {
             .custom()
             .or_else(|| {
                 let styles = styles?;
-                let CounterKey::Selector(Selector::Elem(func, _)) = self.0 else {
-                    return None;
-                };
-
-                if func == HeadingElem::elem() {
-                    HeadingElem::numbering_in(styles).clone()
-                } else if func == FigureElem::elem() {
-                    FigureElem::numbering_in(styles).clone()
-                } else if func == EquationElem::elem() {
-                    EquationElem::numbering_in(styles).clone()
-                } else if func == FootnoteElem::elem() {
-                    Some(FootnoteElem::numbering_in(styles).clone())
-                } else {
-                    None
+                match self.0 {
+                    CounterKey::Page => PageElem::numbering_in(styles).clone(),
+                    CounterKey::Selector(Selector::Elem(func, _)) => {
+                        if func == HeadingElem::elem() {
+                            HeadingElem::numbering_in(styles).clone()
+                        } else if func == FigureElem::elem() {
+                            FigureElem::numbering_in(styles).clone()
+                        } else if func == EquationElem::elem() {
+                            EquationElem::numbering_in(styles).clone()
+                        } else if func == FootnoteElem::elem() {
+                            Some(FootnoteElem::numbering_in(styles).clone())
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
                 }
             })
             .unwrap_or_else(|| NumberingPattern::from_str("1.1").unwrap().into());
@@ -392,6 +394,11 @@ impl Counter {
 
         let context = Context::new(Some(location), styles);
         state.display(engine, context.track(), &numbering)
+    }
+
+    /// Selects all state updates.
+    pub fn select_any() -> Selector {
+        CounterUpdateElem::elem().select()
     }
 }
 
@@ -421,11 +428,8 @@ impl Counter {
     #[func(contextual)]
     pub fn get(
         &self,
-        /// The engine.
         engine: &mut Engine,
-        /// The callsite context.
         context: Tracked<Context>,
-        /// The callsite span.
         span: Span,
     ) -> SourceResult<CounterState> {
         let loc = context.location().at(span)?;
@@ -434,19 +438,11 @@ impl Counter {
 
     /// Displays the current value of the counter with a numbering and returns
     /// the formatted output.
-    ///
-    /// _Compatibility:_ For compatibility with Typst 0.10 and lower, this
-    /// function also works without an established context. Then, it will create
-    /// opaque contextual content rather than directly returning the output of
-    /// the numbering. This behaviour will be removed in a future release.
     #[func(contextual)]
     pub fn display(
         self,
-        /// The engine.
         engine: &mut Engine,
-        /// The callsite context.
         context: Tracked<Context>,
-        /// The call span of the display.
         span: Span,
         /// A [numbering pattern or a function]($numbering), which specifies how
         /// to display the counter. If given a function, that function receives
@@ -467,19 +463,8 @@ impl Counter {
         #[default(false)]
         both: bool,
     ) -> SourceResult<Value> {
-        if let Ok(loc) = context.location() {
-            self.display_impl(engine, loc, numbering, both, context.styles().ok())
-        } else {
-            engine.sink.warn(warning!(
-                span, "`counter.display` without context is deprecated";
-                hint: "use it in a `context` expression instead"
-            ));
-
-            Ok(CounterDisplayElem::new(self, numbering, both)
-                .pack()
-                .spanned(span)
-                .into_value())
-        }
+        let loc = context.location().at(span)?;
+        self.display_impl(engine, loc, numbering, both, context.styles().ok())
     }
 
     /// Retrieves the value of the counter at the given location. Always returns
@@ -488,18 +473,11 @@ impl Counter {
     /// The `selector` must match exactly one element in the document. The most
     /// useful kinds of selectors for this are [labels]($label) and
     /// [locations]($location).
-    ///
-    /// _Compatibility:_ For compatibility with Typst 0.10 and lower, this
-    /// function also works without a known context if the `selector` is a
-    /// location. This behaviour will be removed in a future release.
     #[func(contextual)]
     pub fn at(
         &self,
-        /// The engine.
         engine: &mut Engine,
-        /// The callsite context.
         context: Tracked<Context>,
-        /// The callsite span.
         span: Span,
         /// The place at which the counter's value should be retrieved.
         selector: LocatableSelector,
@@ -513,32 +491,16 @@ impl Counter {
     #[func(contextual)]
     pub fn final_(
         &self,
-        /// The engine.
         engine: &mut Engine,
-        /// The callsite context.
         context: Tracked<Context>,
-        /// The callsite span.
         span: Span,
-        /// _Compatibility:_ This argument is deprecated. It only exists for
-        /// compatibility with Typst 0.10 and lower and shouldn't be used
-        /// anymore.
-        #[default]
-        location: Option<Location>,
     ) -> SourceResult<CounterState> {
-        if location.is_none() {
-            context.location().at(span)?;
-        } else {
-            engine.sink.warn(warning!(
-                span, "calling `counter.final` with a location is deprecated";
-                hint: "try removing the location argument"
-            ));
-        }
-
+        context.introspect().at(span)?;
         let sequence = self.sequence(engine)?;
         let (mut state, page) = sequence.last().unwrap().clone();
         if self.is_page() {
             let delta = engine.introspector.pages().get().saturating_sub(page.get());
-            state.step(NonZeroUsize::ONE, delta);
+            state.step(NonZeroUsize::ONE, delta as u64);
         }
         Ok(state)
     }
@@ -554,7 +516,6 @@ impl Counter {
     #[func]
     pub fn step(
         self,
-        /// The call span of the update.
         span: Span,
         /// The depth at which to step the counter. Defaults to `{1}`.
         #[named]
@@ -571,7 +532,6 @@ impl Counter {
     #[func]
     pub fn update(
         self,
-        /// The call span of the update.
         span: Span,
         /// If given an integer or array of integers, sets the counter to that
         /// value. If given a function, that function receives the previous
@@ -656,13 +616,13 @@ pub trait Count {
 
 /// Counts through elements with different levels.
 #[derive(Debug, Clone, PartialEq, Hash)]
-pub struct CounterState(pub SmallVec<[usize; 3]>);
+pub struct CounterState(pub SmallVec<[u64; 3]>);
 
 impl CounterState {
     /// Get the initial counter state for the key.
     pub fn init(page: bool) -> Self {
         // Special case, because pages always start at one.
-        Self(smallvec![usize::from(page)])
+        Self(smallvec![u64::from(page)])
     }
 
     /// Advance the counter and return the numbers for the given heading.
@@ -685,7 +645,7 @@ impl CounterState {
     }
 
     /// Advance the number of the given level by the specified amount.
-    pub fn step(&mut self, level: NonZeroUsize, by: usize) {
+    pub fn step(&mut self, level: NonZeroUsize, by: u64) {
         let level = level.get();
 
         while self.0.len() < level {
@@ -697,7 +657,7 @@ impl CounterState {
     }
 
     /// Get the first number of the state.
-    pub fn first(&self) -> usize {
+    pub fn first(&self) -> u64 {
         self.0.first().copied().unwrap_or(1)
     }
 
@@ -715,7 +675,7 @@ impl CounterState {
 cast! {
     CounterState,
     self => Value::Array(self.0.into_iter().map(IntoValue::into_value).collect()),
-    num: usize => Self(smallvec![num]),
+    num: u64 => Self(smallvec![num]),
     array: Array => Self(array
         .into_iter()
         .map(Value::cast)
@@ -754,8 +714,6 @@ impl Count for Packed<CounterUpdateElem> {
 }
 
 /// Executes a display of a counter.
-///
-/// **Deprecation planned.**
 #[elem(Construct, Locatable, Show)]
 pub struct CounterDisplayElem {
     /// The counter.
@@ -781,7 +739,6 @@ impl Construct for CounterDisplayElem {
 }
 
 impl Show for Packed<CounterDisplayElem> {
-    #[typst_macros::time(name = "counter.display", span = self.span())]
     fn show(&self, engine: &mut Engine, styles: StyleChain) -> SourceResult<Content> {
         Ok(self
             .counter
@@ -801,7 +758,7 @@ impl Show for Packed<CounterDisplayElem> {
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
 pub struct ManualPageCounter {
     physical: NonZeroUsize,
-    logical: usize,
+    logical: u64,
 }
 
 impl ManualPageCounter {
@@ -816,7 +773,7 @@ impl ManualPageCounter {
     }
 
     /// Get the current logical page counter state.
-    pub fn logical(&self) -> usize {
+    pub fn logical(&self) -> u64 {
         self.logical
     }
 
@@ -829,7 +786,7 @@ impl ManualPageCounter {
                     let Some(elem) = elem.to_packed::<CounterUpdateElem>() else {
                         continue;
                     };
-                    if *elem.key() == CounterKey::Page {
+                    if elem.key == CounterKey::Page {
                         let mut state = CounterState(smallvec![self.logical]);
                         state.update(engine, elem.update.clone())?;
                         self.logical = state.first();

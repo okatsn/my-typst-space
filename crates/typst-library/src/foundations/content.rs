@@ -3,13 +3,12 @@ use std::fmt::{self, Debug, Formatter};
 use std::hash::{Hash, Hasher};
 use std::iter::{self, Sum};
 use std::marker::PhantomData;
-use std::ops::{Add, AddAssign, Deref, DerefMut};
+use std::ops::{Add, AddAssign, ControlFlow, Deref, DerefMut};
 use std::sync::Arc;
 
 use comemo::Tracked;
 use ecow::{eco_format, EcoString};
 use serde::{Serialize, Serializer};
-use smallvec::smallvec;
 use typst_syntax::Span;
 use typst_utils::{fat, singleton, LazyHash, SmallBitSet};
 
@@ -211,9 +210,10 @@ impl Content {
     /// instead.
     pub fn get_by_name(&self, name: &str) -> Result<Value, FieldAccessError> {
         if name == "label" {
-            if let Some(label) = self.label() {
-                return Ok(label.into_value());
-            }
+            return self
+                .label()
+                .map(|label| label.into_value())
+                .ok_or(FieldAccessError::Unknown);
         }
         let id = self.elem().field_id(name).ok_or(FieldAccessError::Unknown)?;
         self.get(id, None)
@@ -414,10 +414,11 @@ impl Content {
     /// Elements produced in `show` rules will not be included in the results.
     pub fn query(&self, selector: Selector) -> Vec<Content> {
         let mut results = Vec::new();
-        self.traverse(&mut |element| {
+        self.traverse(&mut |element| -> ControlFlow<()> {
             if selector.matches(&element, None) {
                 results.push(element);
             }
+            ControlFlow::Continue(())
         });
         results
     }
@@ -426,77 +427,84 @@ impl Content {
     /// selector.
     ///
     /// Elements produced in `show` rules will not be included in the results.
-    pub fn query_first(&self, selector: Selector) -> Option<Content> {
-        let mut result = None;
-        self.traverse(&mut |element| {
-            if result.is_none() && selector.matches(&element, None) {
-                result = Some(element);
+    pub fn query_first(&self, selector: &Selector) -> Option<Content> {
+        self.traverse(&mut |element| -> ControlFlow<Content> {
+            if selector.matches(&element, None) {
+                ControlFlow::Break(element)
+            } else {
+                ControlFlow::Continue(())
             }
-        });
-        result
+        })
+        .break_value()
     }
 
     /// Extracts the plain text of this content.
     pub fn plain_text(&self) -> EcoString {
         let mut text = EcoString::new();
-        self.traverse(&mut |element| {
+        self.traverse(&mut |element| -> ControlFlow<()> {
             if let Some(textable) = element.with::<dyn PlainText>() {
                 textable.plain_text(&mut text);
             }
+            ControlFlow::Continue(())
         });
         text
     }
 
     /// Traverse this content.
-    fn traverse<F>(&self, f: &mut F)
+    fn traverse<F, B>(&self, f: &mut F) -> ControlFlow<B>
     where
-        F: FnMut(Content),
+        F: FnMut(Content) -> ControlFlow<B>,
     {
-        f(self.clone());
-
-        self.inner
-            .elem
-            .fields()
-            .into_iter()
-            .for_each(|(_, value)| walk_value(value, f));
-
         /// Walks a given value to find any content that matches the selector.
-        fn walk_value<F>(value: Value, f: &mut F)
+        ///
+        /// Returns early if the function gives `ControlFlow::Break`.
+        fn walk_value<F, B>(value: Value, f: &mut F) -> ControlFlow<B>
         where
-            F: FnMut(Content),
+            F: FnMut(Content) -> ControlFlow<B>,
         {
             match value {
                 Value::Content(content) => content.traverse(f),
                 Value::Array(array) => {
                     for value in array {
-                        walk_value(value, f);
+                        walk_value(value, f)?;
                     }
+                    ControlFlow::Continue(())
                 }
-                _ => {}
+                _ => ControlFlow::Continue(()),
             }
         }
+
+        // Call f on the element itself before recursively iterating its fields.
+        f(self.clone())?;
+        for (_, value) in self.inner.elem.fields() {
+            walk_value(value, f)?;
+        }
+        ControlFlow::Continue(())
     }
 }
 
 impl Content {
     /// Strongly emphasize this content.
     pub fn strong(self) -> Self {
-        StrongElem::new(self).pack()
+        let span = self.span();
+        StrongElem::new(self).pack().spanned(span)
     }
 
     /// Emphasize this content.
     pub fn emph(self) -> Self {
-        EmphElem::new(self).pack()
+        let span = self.span();
+        EmphElem::new(self).pack().spanned(span)
     }
 
     /// Underline this content.
     pub fn underlined(self) -> Self {
-        UnderlineElem::new(self).pack()
+        let span = self.span();
+        UnderlineElem::new(self).pack().spanned(span)
     }
 
     /// Link the content somewhere.
     pub fn linked(self, dest: Destination) -> Self {
-        self.styled(LinkElem::set_dests(smallvec![dest]))
+        self.styled(LinkElem::set_current(Some(dest)))
     }
 
     /// Set alignments for this content.
@@ -506,17 +514,24 @@ impl Content {
 
     /// Pad this content at the sides.
     pub fn padded(self, padding: Sides<Rel<Length>>) -> Self {
+        let span = self.span();
         PadElem::new(self)
             .with_left(padding.left)
             .with_top(padding.top)
             .with_right(padding.right)
             .with_bottom(padding.bottom)
             .pack()
+            .spanned(span)
     }
 
     /// Transform this content's contents without affecting layout.
     pub fn moved(self, delta: Axes<Rel<Length>>) -> Self {
-        MoveElem::new(self).with_dx(delta.x).with_dy(delta.y).pack()
+        let span = self.span();
+        MoveElem::new(self)
+            .with_dx(delta.x)
+            .with_dy(delta.y)
+            .pack()
+            .spanned(span)
     }
 }
 

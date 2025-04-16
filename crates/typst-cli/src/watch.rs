@@ -13,32 +13,38 @@ use same_file::is_same_file;
 use typst::diag::{bail, StrResult};
 use typst::utils::format_duration;
 
-use crate::args::{CompileCommand, Input, Output};
-use crate::compile::compile_once;
+use crate::args::{Input, Output, WatchCommand};
+use crate::compile::{compile_once, CompileConfig};
 use crate::timings::Timer;
 use crate::world::{SystemWorld, WorldCreationError};
 use crate::{print_error, terminal};
 
 /// Execute a watching compilation command.
-pub fn watch(mut timer: Timer, mut command: CompileCommand) -> StrResult<()> {
-    let Output::Path(output) = command.output() else {
+pub fn watch(timer: &mut Timer, command: &WatchCommand) -> StrResult<()> {
+    let mut config = CompileConfig::watching(command)?;
+
+    let Output::Path(output) = &config.output else {
         bail!("cannot write document to stdout in watch mode");
     };
 
     // Create a file system watcher.
-    let mut watcher = Watcher::new(output)?;
+    let mut watcher = Watcher::new(output.clone())?;
 
     // Create the world that serves sources, files, and fonts.
     // Additionally, if any files do not exist, wait until they do.
     let mut world = loop {
-        match SystemWorld::new(&command.common) {
+        match SystemWorld::new(
+            &command.args.input,
+            &command.args.world,
+            &command.args.process,
+        ) {
             Ok(world) => break world,
             Err(
                 ref err @ (WorldCreationError::InputNotFound(ref path)
                 | WorldCreationError::RootNotFound(ref path)),
             ) => {
                 watcher.update([path.clone()])?;
-                Status::Error.print(&command).unwrap();
+                Status::Error.print(&config).unwrap();
                 print_error(&err.to_string()).unwrap();
                 watcher.wait()?;
             }
@@ -47,13 +53,13 @@ pub fn watch(mut timer: Timer, mut command: CompileCommand) -> StrResult<()> {
     };
 
     // Perform initial compilation.
-    timer.record(&mut world, |world| compile_once(world, &mut command, true))??;
-
-    // Watch all dependencies of the initial compilation.
-    watcher.update(world.dependencies())?;
+    timer.record(&mut world, |world| compile_once(world, &mut config))??;
 
     // Recompile whenever something relevant happens.
     loop {
+        // Watch all dependencies of the most recent compilation.
+        watcher.update(world.dependencies())?;
+
         // Wait until anything relevant happens.
         watcher.wait()?;
 
@@ -61,13 +67,10 @@ pub fn watch(mut timer: Timer, mut command: CompileCommand) -> StrResult<()> {
         world.reset();
 
         // Recompile.
-        timer.record(&mut world, |world| compile_once(world, &mut command, true))??;
+        timer.record(&mut world, |world| compile_once(world, &mut config))??;
 
         // Evict the cache.
         comemo::evict(10);
-
-        // Adjust the file watching.
-        watcher.update(world.dependencies())?;
     }
 }
 
@@ -198,6 +201,10 @@ impl Watcher {
                 let event = event
                     .map_err(|err| eco_format!("failed to watch dependencies ({err})"))?;
 
+                if !is_relevant_event_kind(&event.kind) {
+                    continue;
+                }
+
                 // Workaround for notify-rs' implicit unwatch on remove/rename
                 // (triggered by some editors when saving files) with the
                 // inotify backend. By keeping track of the potentially
@@ -218,7 +225,17 @@ impl Watcher {
                     }
                 }
 
-                relevant |= self.is_event_relevant(&event);
+                // Don't recompile because the output file changed.
+                // FIXME: This doesn't work properly for multifile image export.
+                if event
+                    .paths
+                    .iter()
+                    .all(|path| is_same_file(path, &self.output).unwrap_or(false))
+                {
+                    continue;
+                }
+
+                relevant = true;
             }
 
             // If we found a relevant event or if any of the missing files now
@@ -228,32 +245,23 @@ impl Watcher {
             }
         }
     }
+}
 
-    /// Whether a watch event is relevant for compilation.
-    fn is_event_relevant(&self, event: &notify::Event) -> bool {
-        // Never recompile because the output file changed.
-        if event
-            .paths
-            .iter()
-            .all(|path| is_same_file(path, &self.output).unwrap_or(false))
-        {
-            return false;
-        }
-
-        match &event.kind {
-            notify::EventKind::Any => true,
-            notify::EventKind::Access(_) => false,
-            notify::EventKind::Create(_) => true,
-            notify::EventKind::Modify(kind) => match kind {
-                notify::event::ModifyKind::Any => true,
-                notify::event::ModifyKind::Data(_) => true,
-                notify::event::ModifyKind::Metadata(_) => false,
-                notify::event::ModifyKind::Name(_) => true,
-                notify::event::ModifyKind::Other => false,
-            },
-            notify::EventKind::Remove(_) => true,
-            notify::EventKind::Other => false,
-        }
+/// Whether a kind of watch event is relevant for compilation.
+fn is_relevant_event_kind(kind: &notify::EventKind) -> bool {
+    match kind {
+        notify::EventKind::Any => true,
+        notify::EventKind::Access(_) => false,
+        notify::EventKind::Create(_) => true,
+        notify::EventKind::Modify(kind) => match kind {
+            notify::event::ModifyKind::Any => true,
+            notify::event::ModifyKind::Data(_) => true,
+            notify::event::ModifyKind::Metadata(_) => false,
+            notify::event::ModifyKind::Name(_) => true,
+            notify::event::ModifyKind::Other => false,
+        },
+        notify::EventKind::Remove(_) => true,
+        notify::EventKind::Other => false,
     }
 }
 
@@ -267,8 +275,7 @@ pub enum Status {
 
 impl Status {
     /// Clear the terminal and render the status message.
-    pub fn print(&self, command: &CompileCommand) -> io::Result<()> {
-        let output = command.output();
+    pub fn print(&self, config: &CompileConfig) -> io::Result<()> {
         let timestamp = chrono::offset::Local::now().format("%H:%M:%S");
         let color = self.color();
 
@@ -278,7 +285,7 @@ impl Status {
         out.set_color(&color)?;
         write!(out, "watching")?;
         out.reset()?;
-        match &command.common.input {
+        match &config.input {
             Input::Stdin => writeln!(out, " <stdin>"),
             Input::Path(path) => writeln!(out, " {}", path.display()),
         }?;
@@ -286,7 +293,15 @@ impl Status {
         out.set_color(&color)?;
         write!(out, "writing to")?;
         out.reset()?;
-        writeln!(out, " {output}")?;
+        writeln!(out, " {}", config.output)?;
+
+        #[cfg(feature = "http-server")]
+        if let Some(server) = &config.server {
+            out.set_color(&color)?;
+            write!(out, "serving at")?;
+            out.reset()?;
+            writeln!(out, " http://{}", server.addr())?;
+        }
 
         writeln!(out)?;
         writeln!(out, "[{timestamp}] {}", self.message())?;

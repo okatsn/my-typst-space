@@ -1,23 +1,23 @@
 use std::fmt::{self, Debug, Formatter};
 
 use rustybuzz::Feature;
-use smallvec::SmallVec;
 use ttf_parser::gsub::{AlternateSubstitution, SingleSubstitution, SubstitutionSubtable};
 use ttf_parser::opentype_layout::LayoutTable;
 use ttf_parser::{GlyphId, Rect};
 use typst_library::foundations::StyleChain;
 use typst_library::introspection::Tag;
 use typst_library::layout::{
-    Abs, Axis, Corner, Em, Frame, FrameItem, HideElem, Point, Size, VAlignment,
+    Abs, Axis, Corner, Em, Frame, FrameItem, Point, Size, VAlignment,
 };
 use typst_library::math::{EquationElem, MathSize};
-use typst_library::model::{Destination, LinkElem};
 use typst_library::text::{Font, Glyph, Lang, Region, TextElem, TextItem};
 use typst_library::visualize::Paint;
 use typst_syntax::Span;
+use typst_utils::default_math_class;
 use unicode_math_class::MathClass;
 
-use super::{scaled_font_size, stretch_glyph, MathContext, Scaled};
+use super::{stretch_glyph, MathContext, Scaled};
+use crate::modifiers::{FrameModifiers, FrameModify};
 
 #[derive(Debug, Clone)]
 pub enum MathFragment {
@@ -148,7 +148,8 @@ impl MathFragment {
 
     pub fn is_text_like(&self) -> bool {
         match self {
-            Self::Glyph(_) | Self::Variant(_) => self.class() != MathClass::Large,
+            Self::Glyph(glyph) => !glyph.extended_shape,
+            Self::Variant(variant) => !variant.extended_shape,
             MathFragment::Frame(frame) => frame.text_like,
             _ => false,
         }
@@ -244,9 +245,9 @@ pub struct GlyphFragment {
     pub class: MathClass,
     pub math_size: MathSize,
     pub span: Span,
-    pub dests: SmallVec<[Destination; 1]>,
-    pub hidden: bool,
+    pub modifiers: FrameModifiers,
     pub limits: Limits,
+    pub extended_shape: bool,
 }
 
 impl GlyphFragment {
@@ -275,11 +276,7 @@ impl GlyphFragment {
         span: Span,
     ) -> Self {
         let class = EquationElem::class_in(styles)
-            .or_else(|| match c {
-                ':' => Some(MathClass::Relation),
-                '.' | '/' | '⋯' | '⋱' | '⋰' | '⋮' => Some(MathClass::Normal),
-                _ => unicode_math_class::class(c),
-            })
+            .or_else(|| default_math_class(c))
             .unwrap_or(MathClass::Normal);
 
         let mut fragment = Self {
@@ -290,7 +287,7 @@ impl GlyphFragment {
             region: TextElem::region_in(styles),
             fill: TextElem::fill_in(styles).as_decoration(),
             shift: TextElem::baseline_in(styles),
-            font_size: scaled_font_size(ctx, styles),
+            font_size: TextElem::size_in(styles),
             math_size: EquationElem::size_in(styles),
             width: Abs::zero(),
             ascent: Abs::zero(),
@@ -300,8 +297,8 @@ impl GlyphFragment {
             accent_attach: Abs::zero(),
             class,
             span,
-            dests: LinkElem::dests_in(styles),
-            hidden: HideElem::hidden_in(styles),
+            modifiers: FrameModifiers::get_in(styles),
+            extended_shape: false,
         };
         fragment.set_id(ctx, id);
         fragment
@@ -332,7 +329,8 @@ impl GlyphFragment {
         let accent_attach =
             accent_attach(ctx, id, self.font_size).unwrap_or((width + italics) / 2.0);
 
-        if !is_extended_shape(ctx, id) {
+        let extended_shape = is_extended_shape(ctx, id);
+        if !extended_shape {
             width += italics;
         }
 
@@ -342,6 +340,7 @@ impl GlyphFragment {
         self.descent = -bbox.y_min.scaled(ctx, self.font_size);
         self.italics_correction = italics;
         self.accent_attach = accent_attach;
+        self.extended_shape = extended_shape;
     }
 
     pub fn height(&self) -> Abs {
@@ -358,6 +357,7 @@ impl GlyphFragment {
             math_size: self.math_size,
             span: self.span,
             limits: self.limits,
+            extended_shape: self.extended_shape,
             frame: self.into_frame(),
             mid_stretched: None,
         }
@@ -384,7 +384,7 @@ impl GlyphFragment {
         let mut frame = Frame::soft(size);
         frame.set_baseline(self.ascent);
         frame.push(Point::with_y(self.ascent + self.shift), FrameItem::Text(item));
-        frame.post_process_raw(self.dests, self.hidden);
+        frame.modify(&self.modifiers);
         frame
     }
 
@@ -465,6 +465,7 @@ pub struct VariantFragment {
     pub span: Span,
     pub limits: Limits,
     pub mid_stretched: Option<bool>,
+    pub extended_shape: bool,
 }
 
 impl VariantFragment {
@@ -505,12 +506,12 @@ pub struct FrameFragment {
 }
 
 impl FrameFragment {
-    pub fn new(ctx: &MathContext, styles: StyleChain, frame: Frame) -> Self {
+    pub fn new(styles: StyleChain, frame: Frame) -> Self {
         let base_ascent = frame.ascent();
         let accent_attach = frame.width() / 2.0;
         Self {
-            frame: frame.post_processed(styles),
-            font_size: scaled_font_size(ctx, styles),
+            frame: frame.modified(&FrameModifiers::get_in(styles)),
+            font_size: TextElem::size_in(styles),
             class: EquationElem::class_in(styles).unwrap_or(MathClass::Normal),
             math_size: EquationElem::size_in(styles),
             limits: Limits::Never,
@@ -625,7 +626,7 @@ pub enum Limits {
 impl Limits {
     /// The default limit configuration if the given character is the base.
     pub fn for_char(c: char) -> Self {
-        match unicode_math_class::class(c) {
+        match default_math_class(c) {
             Some(MathClass::Large) => {
                 if is_integral_char(c) {
                     Limits::Never

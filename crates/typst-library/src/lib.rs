@@ -15,11 +15,13 @@ extern crate self as typst_library;
 pub mod diag;
 pub mod engine;
 pub mod foundations;
+pub mod html;
 pub mod introspection;
 pub mod layout;
 pub mod loading;
 pub mod math;
 pub mod model;
+pub mod pdf;
 pub mod routines;
 pub mod symbols;
 pub mod text;
@@ -27,13 +29,12 @@ pub mod visualize;
 
 use std::ops::{Deref, Range};
 
-use ecow::EcoString;
-use typst_syntax::package::PackageSpec;
+use serde::{Deserialize, Serialize};
 use typst_syntax::{FileId, Source, Span};
-use typst_utils::LazyHash;
+use typst_utils::{LazyHash, SmallBitSet};
 
 use crate::diag::FileResult;
-use crate::foundations::{Array, Bytes, Datetime, Dict, Module, Scope, Styles, Value};
+use crate::foundations::{Array, Binding, Bytes, Datetime, Dict, Module, Scope, Styles};
 use crate::layout::{Alignment, Dir};
 use crate::text::{Font, FontBook};
 use crate::visualize::Color;
@@ -83,16 +84,6 @@ pub trait World: Send + Sync {
     /// If this function returns `None`, Typst's `datetime` function will
     /// return an error.
     fn today(&self, offset: Option<i64>) -> Option<Datetime>;
-
-    /// A list of all available packages and optionally descriptions for them.
-    ///
-    /// This function is optional to implement. It enhances the user experience
-    /// by enabling autocompletion for packages. Details about packages from the
-    /// `@preview` namespace are available from
-    /// `https://packages.typst.org/preview/index.json`.
-    fn packages(&self) -> &[(PackageSpec, Option<EcoString>)] {
-        &[]
-    }
 }
 
 macro_rules! world_impl {
@@ -125,10 +116,6 @@ macro_rules! world_impl {
             fn today(&self, offset: Option<i64>) -> Option<Datetime> {
                 self.deref().today(offset)
             }
-
-            fn packages(&self) -> &[(PackageSpec, Option<EcoString>)] {
-                self.deref().packages()
-            }
         }
     };
 }
@@ -141,13 +128,13 @@ world_impl!(W for &W);
 pub trait WorldExt {
     /// Get the byte range for a span.
     ///
-    /// Returns `None` if the `Span` does not point into any source file.
+    /// Returns `None` if the `Span` does not point into any file.
     fn range(&self, span: Span) -> Option<Range<usize>>;
 }
 
-impl<T: World> WorldExt for T {
+impl<T: World + ?Sized> WorldExt for T {
     fn range(&self, span: Span) -> Option<Range<usize>> {
-        self.source(span.id()?).ok()?.range(span)
+        span.range().or_else(|| self.source(span.id()?).ok()?.range(span))
     }
 }
 
@@ -161,9 +148,10 @@ pub struct Library {
     /// The default style properties (for page size, font selection, and
     /// everything else configurable via set and show rules).
     pub styles: Styles,
-    /// The standard library as a value.
-    /// Used to provide the `std` variable.
-    pub std: Value,
+    /// The standard library as a value. Used to provide the `std` variable.
+    pub std: Binding,
+    /// In-development features that were enabled.
+    pub features: Features,
 }
 
 impl Library {
@@ -186,6 +174,7 @@ impl Default for Library {
 #[derive(Debug, Clone, Default)]
 pub struct LibraryBuilder {
     inputs: Option<Dict>,
+    features: Features,
 }
 
 impl LibraryBuilder {
@@ -195,36 +184,125 @@ impl LibraryBuilder {
         self
     }
 
+    /// Configure in-development features that should be enabled.
+    ///
+    /// No guarantees whatsover!
+    pub fn with_features(mut self, features: Features) -> Self {
+        self.features = features;
+        self
+    }
+
     /// Consumes the builder and returns a `Library`.
     pub fn build(self) -> Library {
         let math = math::module();
         let inputs = self.inputs.unwrap_or_default();
-        let global = global(math.clone(), inputs);
-        let std = Value::Module(global.clone());
-        Library { global, math, styles: Styles::new(), std }
+        let global = global(math.clone(), inputs, &self.features);
+        Library {
+            global: global.clone(),
+            math,
+            styles: Styles::new(),
+            std: Binding::detached(global),
+            features: self.features,
+        }
+    }
+}
+
+/// A selection of in-development features that should be enabled.
+///
+/// Can be collected from an iterator of [`Feature`]s.
+#[derive(Debug, Default, Clone, Hash)]
+pub struct Features(SmallBitSet);
+
+impl Features {
+    /// Check whether the given feature is enabled.
+    pub fn is_enabled(&self, feature: Feature) -> bool {
+        self.0.contains(feature as usize)
+    }
+}
+
+impl FromIterator<Feature> for Features {
+    fn from_iter<T: IntoIterator<Item = Feature>>(iter: T) -> Self {
+        let mut set = SmallBitSet::default();
+        for feature in iter {
+            set.insert(feature as usize);
+        }
+        Self(set)
+    }
+}
+
+/// An in-development feature that should be enabled.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+#[non_exhaustive]
+pub enum Feature {
+    Html,
+}
+
+/// A group of related standard library definitions.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Category {
+    Foundations,
+    Introspection,
+    Layout,
+    DataLoading,
+    Math,
+    Model,
+    Symbols,
+    Text,
+    Visualize,
+    Pdf,
+    Html,
+    Svg,
+    Png,
+}
+
+impl Category {
+    /// The kebab-case name of the category.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Foundations => "foundations",
+            Self::Introspection => "introspection",
+            Self::Layout => "layout",
+            Self::DataLoading => "data-loading",
+            Self::Math => "math",
+            Self::Model => "model",
+            Self::Symbols => "symbols",
+            Self::Text => "text",
+            Self::Visualize => "visualize",
+            Self::Pdf => "pdf",
+            Self::Html => "html",
+            Self::Svg => "svg",
+            Self::Png => "png",
+        }
     }
 }
 
 /// Construct the module with global definitions.
-fn global(math: Module, inputs: Dict) -> Module {
+fn global(math: Module, inputs: Dict, features: &Features) -> Module {
     let mut global = Scope::deduplicating();
-    self::foundations::define(&mut global, inputs);
+
+    self::foundations::define(&mut global, inputs, features);
     self::model::define(&mut global);
     self::text::define(&mut global);
-    global.reset_category();
-    global.define_module(math);
     self::layout::define(&mut global);
     self::visualize::define(&mut global);
     self::introspection::define(&mut global);
     self::loading::define(&mut global);
     self::symbols::define(&mut global);
+
+    global.define("math", math);
+    global.define("pdf", self::pdf::module());
+    if features.is_enabled(Feature::Html) {
+        global.define("html", self::html::module());
+    }
+
     prelude(&mut global);
+
     Module::new("global", global)
 }
 
 /// Defines scoped values that are globally available, too.
 fn prelude(global: &mut Scope) {
-    global.reset_category();
     global.define("black", Color::BLACK);
     global.define("gray", Color::GRAY);
     global.define("silver", Color::SILVER);

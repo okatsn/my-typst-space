@@ -6,7 +6,9 @@ use ecow::eco_format;
 use typst_utils::Numeric;
 
 use crate::diag::{bail, HintedStrResult, StrResult};
-use crate::foundations::{format_str, Datetime, IntoValue, Regex, Repr, Value};
+use crate::foundations::{
+    format_str, Datetime, IntoValue, Regex, Repr, SymbolElem, Value,
+};
 use crate::layout::{Alignment, Length, Rel};
 use crate::text::TextElem;
 use crate::visualize::Stroke;
@@ -30,17 +32,13 @@ pub fn join(lhs: Value, rhs: Value) -> StrResult<Value> {
         (Symbol(a), Str(b)) => Str(format_str!("{a}{b}")),
         (Bytes(a), Bytes(b)) => Bytes(a + b),
         (Content(a), Content(b)) => Content(a + b),
-        (Content(a), Symbol(b)) => Content(a + TextElem::packed(b.get())),
+        (Content(a), Symbol(b)) => Content(a + SymbolElem::packed(b.get())),
         (Content(a), Str(b)) => Content(a + TextElem::packed(b)),
         (Str(a), Content(b)) => Content(TextElem::packed(a) + b),
-        (Symbol(a), Content(b)) => Content(TextElem::packed(a.get()) + b),
+        (Symbol(a), Content(b)) => Content(SymbolElem::packed(a.get()) + b),
         (Array(a), Array(b)) => Array(a + b),
         (Dict(a), Dict(b)) => Dict(a + b),
-
-        // Type compatibility.
-        (Type(a), Str(b)) => Str(format_str!("{a}{b}")),
-        (Str(a), Type(b)) => Str(format_str!("{a}{b}")),
-
+        (Args(a), Args(b)) => Args(a + b),
         (a, b) => mismatch!("cannot join {} with {}", a, b),
     })
 }
@@ -134,13 +132,14 @@ pub fn add(lhs: Value, rhs: Value) -> HintedStrResult<Value> {
         (Symbol(a), Str(b)) => Str(format_str!("{a}{b}")),
         (Bytes(a), Bytes(b)) => Bytes(a + b),
         (Content(a), Content(b)) => Content(a + b),
-        (Content(a), Symbol(b)) => Content(a + TextElem::packed(b.get())),
+        (Content(a), Symbol(b)) => Content(a + SymbolElem::packed(b.get())),
         (Content(a), Str(b)) => Content(a + TextElem::packed(b)),
         (Str(a), Content(b)) => Content(TextElem::packed(a) + b),
-        (Symbol(a), Content(b)) => Content(TextElem::packed(a.get()) + b),
+        (Symbol(a), Content(b)) => Content(SymbolElem::packed(a.get()) + b),
 
         (Array(a), Array(b)) => Array(a + b),
         (Dict(a), Dict(b)) => Dict(a + b),
+        (Args(a), Args(b)) => Args(a + b),
 
         (Color(color), Length(thickness)) | (Length(thickness), Color(color)) => {
             Stroke::from_pair(color, thickness).into_value()
@@ -149,17 +148,13 @@ pub fn add(lhs: Value, rhs: Value) -> HintedStrResult<Value> {
         | (Length(thickness), Gradient(gradient)) => {
             Stroke::from_pair(gradient, thickness).into_value()
         }
-        (Pattern(pattern), Length(thickness)) | (Length(thickness), Pattern(pattern)) => {
-            Stroke::from_pair(pattern, thickness).into_value()
+        (Tiling(tiling), Length(thickness)) | (Length(thickness), Tiling(tiling)) => {
+            Stroke::from_pair(tiling, thickness).into_value()
         }
 
         (Duration(a), Duration(b)) => Duration(a + b),
         (Datetime(a), Duration(b)) => Datetime(a + b),
         (Duration(a), Datetime(b)) => Datetime(b + a),
-
-        // Type compatibility.
-        (Type(a), Str(b)) => Str(format_str!("{a}{b}")),
-        (Str(a), Type(b)) => Str(format_str!("{a}{b}")),
 
         (Dyn(a), Dyn(b)) => {
             // Alignments can be summed.
@@ -452,7 +447,6 @@ pub fn equal(lhs: &Value, rhs: &Value) -> bool {
         (Args(a), Args(b)) => a == b,
         (Type(a), Type(b)) => a == b,
         (Module(a), Module(b)) => a == b,
-        (Plugin(a), Plugin(b)) => a == b,
         (Datetime(a), Datetime(b)) => a == b,
         (Duration(a), Duration(b)) => a == b,
         (Dyn(a), Dyn(b)) => a == b,
@@ -468,9 +462,6 @@ pub fn equal(lhs: &Value, rhs: &Value) -> bool {
         (&Ratio(rat), &Relative(rel)) | (&Relative(rel), &Ratio(rat)) => {
             rat == rel.rel && rel.abs.is_zero()
         }
-
-        // Type compatibility.
-        (Type(ty), Str(str)) | (Str(str), Type(ty)) => ty.compat_name() == str.as_str(),
 
         _ => false,
     }
@@ -568,10 +559,6 @@ pub fn contains(lhs: &Value, rhs: &Value) -> Option<bool> {
         (Dyn(a), Str(b)) => a.downcast::<Regex>().map(|regex| regex.is_match(b)),
         (Str(a), Dict(b)) => Some(b.contains(a)),
         (a, Array(b)) => Some(b.contains(a.clone())),
-
-        // Type compatibility.
-        (Type(a), Str(b)) => Some(b.as_str().contains(a.compat_name())),
-        (Type(a), Dict(b)) => Some(b.contains(a.compat_name())),
 
         _ => Option::None,
     }

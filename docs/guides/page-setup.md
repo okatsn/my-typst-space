@@ -56,7 +56,7 @@ requirements with examples.
 Typst's default page size is A4 paper. Depending on your region and your use
 case, you will want to change this. You can do this by using the
 [`{page}`]($page) set rule and passing it a string argument to use a common page
-size. Options include the complete ISO 216 series (e.g. `"iso-a4"`, `"iso-c2"`),
+size. Options include the complete ISO 216 series (e.g. `"a4"` and `"iso-c2"`),
 customary US formats like `"us-legal"` or `"us-letter"`, and more. Check out the
 reference for the [page's paper argument]($page.paper) to learn about all
 available options.
@@ -433,7 +433,7 @@ frequently used for [figures]($figure.placement).
 ### Use columns anywhere in your document { #columns-anywhere }
 To create columns within a nested layout, e.g. within a rectangle, you can use
 the [`columns` function]($columns) directly. However, it really should only be
-used within nested layouts. At the page-level, the page set rule is preferrable
+used within nested layouts. At the page-level, the page set rule is preferable
 because it has better interactions with things like page-level floats,
 footnotes, and line numbers.
 

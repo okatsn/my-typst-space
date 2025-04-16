@@ -230,6 +230,13 @@ Z
 #counter(page).update(53)
 #filler
 
+--- page-numbering-hint ---
+= Heading <intro>
+
+// Error: 1:21-1:47 cannot reference without page numbering
+// Hint: 1:21-1:47 you can enable page numbering with `#set page(numbering: "1")`
+Can not be used as #ref(<intro>, form: "page")
+
 --- page-suppress-headers-and-footers ---
 #set page(header: none, footer: none, numbering: "1")
 Look, ma, no page numbers!
@@ -238,6 +245,16 @@ Look, ma, no page numbers!
 
 #set page(header: auto, footer: auto)
 Default page numbers now.
+
+--- page-numbering-huge ---
+#set page(margin: (bottom: 20pt, rest: 0pt))
+#let filler = lines(1)
+
+// Test values greater than 32-bits
+#set page(numbering: "1/1")
+#counter(page).update(100000000001)
+#pagebreak()
+#pagebreak()
 
 --- page-marginal-style-text-set ---
 #set page(numbering: "1", margin: (bottom: 20pt))

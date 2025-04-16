@@ -182,8 +182,7 @@ static EXCEPTION_MAP: phf::Map<&'static str, Exception> = phf::phf_map! {
     "NewCM10-Regular" => Exception::new()
         .family("New Computer Modern"),
     "NewCMMath-Bold" => Exception::new()
-        .family("New Computer Modern Math")
-        .weight(700),
+        .family("New Computer Modern Math"),
     "NewCMMath-Book" => Exception::new()
         .family("New Computer Modern Math")
         .weight(450),
@@ -229,6 +228,8 @@ static EXCEPTION_MAP: phf::Map<&'static str, Exception> = phf::phf_map! {
         .style(FontStyle::Oblique),
     "NewCMSans10-Regular" => Exception::new()
         .family("New Computer Modern Sans"),
+    "NewCMSansMath-Regular" => Exception::new()
+        .family("New Computer Modern Sans Math"),
     "NewCMUncial08-Bold" => Exception::new()
         .family("New Computer Modern Uncial 08"),
     "NewCMUncial08-Book" => Exception::new()

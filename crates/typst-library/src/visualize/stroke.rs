@@ -7,7 +7,7 @@ use crate::foundations::{
     Resolve, Smart, StyleChain, Value,
 };
 use crate::layout::{Abs, Length};
-use crate::visualize::{Color, Gradient, Paint, Pattern};
+use crate::visualize::{Color, Gradient, Paint, Tiling};
 
 /// Defines how to draw a line.
 ///
@@ -97,8 +97,6 @@ impl Stroke {
     /// ```
     #[func(constructor)]
     pub fn construct(
-        /// The real arguments (the other arguments are just for the docs, this
-        /// function is a bit involved, so we parse the arguments manually).
         args: &mut Args,
 
         /// The color or gradient to use for the stroke.
@@ -170,14 +168,20 @@ impl Stroke {
         /// If set to `{auto}`, the value is inherited, defaulting to `{4.0}`.
         ///
         /// ```example
-        /// #let points = ((15pt, 0pt), (0pt, 30pt), (30pt, 30pt), (10pt, 20pt))
-        /// #set path(stroke: 6pt + blue)
+        /// #let items = (
+        ///   curve.move((15pt, 0pt)),
+        ///   curve.line((0pt, 30pt)),
+        ///   curve.line((30pt, 30pt)),
+        ///   curve.line((10pt, 20pt)),
+        /// )
+        ///
+        /// #set curve(stroke: 6pt + blue)
         /// #stack(
-        ///     dir: ltr,
-        ///     spacing: 1cm,
-        ///     path(stroke: (miter-limit: 1), ..points),
-        ///     path(stroke: (miter-limit: 4), ..points),
-        ///     path(stroke: (miter-limit: 5), ..points),
+        ///   dir: ltr,
+        ///   spacing: 1cm,
+        ///   curve(stroke: (miter-limit: 1), ..items),
+        ///   curve(stroke: (miter-limit: 4), ..items),
+        ///   curve(stroke: (miter-limit: 5), ..items),
         /// )
         /// ```
         #[external]
@@ -213,9 +217,9 @@ impl<T: Numeric> Stroke<T> {
             thickness: self.thickness.map(&f),
             cap: self.cap,
             join: self.join,
-            dash: self.dash.map(|pattern| {
-                pattern.map(|pattern| DashPattern {
-                    array: pattern
+            dash: self.dash.map(|dash| {
+                dash.map(|dash| DashPattern {
+                    array: dash
                         .array
                         .into_iter()
                         .map(|l| match l {
@@ -223,7 +227,7 @@ impl<T: Numeric> Stroke<T> {
                             DashLength::LineWidth => DashLength::LineWidth,
                         })
                         .collect(),
-                    phase: f(pattern.phase),
+                    phase: f(dash.phase),
                 })
             }),
             miter_limit: self.miter_limit,
@@ -237,14 +241,10 @@ impl Stroke<Abs> {
         let thickness = self.thickness.unwrap_or(default.thickness);
         let dash = self
             .dash
-            .map(|pattern| {
-                pattern.map(|pattern| DashPattern {
-                    array: pattern
-                        .array
-                        .into_iter()
-                        .map(|l| l.finish(thickness))
-                        .collect(),
-                    phase: pattern.phase,
+            .map(|dash| {
+                dash.map(|dash| DashPattern {
+                    array: dash.array.into_iter().map(|l| l.finish(thickness)).collect(),
+                    phase: dash.phase,
                 })
             })
             .unwrap_or(default.dash);
@@ -372,8 +372,8 @@ cast! {
         paint: Smart::Custom(gradient.into()),
         ..Default::default()
     },
-    pattern: Pattern => Self {
-        paint: Smart::Custom(pattern.into()),
+    tiling: Tiling => Self {
+        paint: Smart::Custom(tiling.into()),
         ..Default::default()
     },
     mut dict: Dict => {

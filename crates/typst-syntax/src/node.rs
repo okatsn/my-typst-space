@@ -5,7 +5,6 @@ use std::sync::Arc;
 
 use ecow::{eco_format, eco_vec, EcoString, EcoVec};
 
-use crate::ast::AstNode;
 use crate::{FileId, Span, SyntaxKind};
 
 /// A node in the untyped syntax tree.
@@ -119,26 +118,6 @@ impl SyntaxNode {
         }
     }
 
-    /// Whether the node can be cast to the given AST node.
-    pub fn is<'a, T: AstNode<'a>>(&'a self) -> bool {
-        self.cast::<T>().is_some()
-    }
-
-    /// Try to convert the node to a typed AST node.
-    pub fn cast<'a, T: AstNode<'a>>(&'a self) -> Option<T> {
-        T::from_untyped(self)
-    }
-
-    /// Cast the first child that can cast to the AST type `T`.
-    pub fn cast_first_match<'a, T: AstNode<'a>>(&'a self) -> Option<T> {
-        self.children().find_map(Self::cast)
-    }
-
-    /// Cast the last child that can cast to the AST type `T`.
-    pub fn cast_last_match<'a, T: AstNode<'a>>(&'a self) -> Option<T> {
-        self.children().rev().find_map(Self::cast)
-    }
-
     /// Whether the node or its children contain an error.
     pub fn erroneous(&self) -> bool {
         match &self.0 {
@@ -241,7 +220,7 @@ impl SyntaxNode {
             return Err(Unnumberable);
         }
 
-        let mid = Span::new(id, (within.start + within.end) / 2).unwrap();
+        let mid = Span::from_number(id, (within.start + within.end) / 2).unwrap();
         match &mut self.0 {
             Repr::Leaf(leaf) => leaf.span = mid,
             Repr::Inner(inner) => Arc::make_mut(inner).numberize(id, None, within)?,
@@ -457,7 +436,7 @@ impl InnerNode {
         let mut start = within.start;
         if range.is_none() {
             let end = start + stride;
-            self.span = Span::new(id, (start + end) / 2).unwrap();
+            self.span = Span::from_number(id, (start + end) / 2).unwrap();
             self.upper = within.end;
             start = end;
         }
@@ -753,7 +732,7 @@ impl<'a> LinkedNode<'a> {
                 // sibling's span number is larger than the target span's number.
                 if children
                     .peek()
-                    .map_or(true, |next| next.span().number() > span.number())
+                    .is_none_or(|next| next.span().number() > span.number())
                 {
                     if let Some(found) = child.find(span) {
                         return Some(found);
@@ -767,7 +746,7 @@ impl<'a> LinkedNode<'a> {
 }
 
 /// Access to parents and siblings.
-impl<'a> LinkedNode<'a> {
+impl LinkedNode<'_> {
     /// Get this node's parent.
     pub fn parent(&self) -> Option<&Self> {
         self.parent.as_deref()
@@ -825,7 +804,7 @@ pub enum Side {
 }
 
 /// Access to leaves.
-impl<'a> LinkedNode<'a> {
+impl LinkedNode<'_> {
     /// Get the rightmost non-trivia leaf before this node.
     pub fn prev_leaf(&self) -> Option<Self> {
         let mut node = self.clone();

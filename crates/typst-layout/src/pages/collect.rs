@@ -23,7 +23,7 @@ pub enum Item<'a> {
 /// things like tags and weak pagebreaks.
 pub fn collect<'a>(
     mut children: &'a mut [Pair<'a>],
-    mut locator: SplitLocator<'a>,
+    locator: &mut SplitLocator<'a>,
     mut initial: StyleChain<'a>,
 ) -> Vec<Item<'a>> {
     // The collected page-level items.
@@ -53,7 +53,7 @@ pub fn collect<'a>(
 
             // The initial styles for the next page are ours unless this is a
             // "boundary" pagebreak. Such a pagebreak is generated at the end of
-            // the scope of a page set rule to ensure a page boundary. It's
+            // the scope of a page set rule to ensure a page boundary. Its
             // styles correspond to the styles _before_ the page set rule, so we
             // don't want to apply it to a potential empty page.
             if !pagebreak.boundary(styles) {

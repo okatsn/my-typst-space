@@ -14,12 +14,12 @@ use typst_library::layout::{
 };
 use typst_library::model::Numbering;
 use typst_library::routines::{Pair, Routines};
-use typst_library::text::TextElem;
+use typst_library::text::{LocalName, TextElem};
 use typst_library::visualize::Paint;
 use typst_library::World;
 use typst_utils::Numeric;
 
-use crate::flow::layout_flow;
+use crate::flow::{layout_flow, FlowMode};
 
 /// A mostly finished layout for one page. Needs only knowledge of its exact
 /// page number to be finalized into a `Page`. (Because the margins can depend
@@ -36,6 +36,7 @@ pub struct LayoutedPage {
     pub foreground: Option<Frame>,
     pub fill: Smart<Option<Paint>>,
     pub numbering: Option<Numbering>,
+    pub supplement: Content,
 }
 
 /// Layout a single page suitable  for parity adjustment.
@@ -128,6 +129,10 @@ fn layout_page_run_impl(
     let header_ascent = PageElem::header_ascent_in(styles).relative_to(margin.top);
     let footer_descent = PageElem::footer_descent_in(styles).relative_to(margin.bottom);
     let numbering = PageElem::numbering_in(styles);
+    let supplement = match PageElem::supplement_in(styles) {
+        Smart::Auto => TextElem::packed(PageElem::local_name_in(styles)),
+        Smart::Custom(content) => content.unwrap_or_default(),
+    };
     let number_align = PageElem::number_align_in(styles);
     let binding =
         PageElem::binding_in(styles).unwrap_or_else(|| match TextElem::dir_in(styles) {
@@ -176,7 +181,7 @@ fn layout_page_run_impl(
         Regions::repeat(area, area.map(Abs::is_finite)),
         PageElem::columns_in(styles),
         ColumnsElem::gutter_in(styles),
-        true,
+        FlowMode::Root,
     )?;
 
     // Layouts a single marginal.
@@ -204,6 +209,7 @@ fn layout_page_run_impl(
             inner,
             fill: fill.clone(),
             numbering: numbering.clone(),
+            supplement: supplement.clone(),
             header: layout_marginal(header, header_size, Alignment::BOTTOM)?,
             footer: layout_marginal(footer, footer_size, Alignment::TOP)?,
             background: layout_marginal(background, full_size, mid)?,

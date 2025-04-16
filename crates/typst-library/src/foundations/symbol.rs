@@ -1,17 +1,18 @@
-#[doc(inline)]
-pub use typst_macros::symbols;
-
 use std::cmp::Reverse;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt::{self, Debug, Display, Formatter, Write};
 use std::sync::Arc;
 
 use ecow::{eco_format, EcoString};
 use serde::{Serialize, Serializer};
-use typst_syntax::{Span, Spanned};
+use typst_syntax::{is_ident, Span, Spanned};
+use typst_utils::hash128;
 
 use crate::diag::{bail, SourceResult, StrResult};
-use crate::foundations::{cast, func, scope, ty, Array, Func};
+use crate::foundations::{
+    cast, elem, func, scope, ty, Array, Content, Func, NativeElement, NativeFunc, Packed,
+    PlainText, Repr as _,
+};
 
 /// A Unicode symbol.
 ///
@@ -20,6 +21,7 @@ use crate::foundations::{cast, func, scope, ty, Array, Func};
 /// be accessed using [field access notation]($scripting/#fields):
 ///
 /// - General symbols are defined in the [`sym` module]($category/symbols/sym)
+///   and are accessible without the `sym.` prefix in math mode.
 /// - Emoji are defined in the [`emoji` module]($category/symbols/emoji)
 ///
 /// Moreover, you can define custom symbols with this type's constructor
@@ -46,73 +48,90 @@ use crate::foundations::{cast, func, scope, ty, Array, Func};
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct Symbol(Repr);
 
-/// The character of a symbol, possibly with a function.
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
-pub struct SymChar(char, Option<fn() -> Func>);
-
 /// The internal representation.
 #[derive(Clone, Eq, PartialEq, Hash)]
 enum Repr {
-    Single(SymChar),
-    Const(&'static [(&'static str, SymChar)]),
-    Multi(Arc<(List, EcoString)>),
+    /// A native symbol that has no named variant.
+    Single(char),
+    /// A native symbol with multiple named variants.
+    Complex(&'static [(&'static str, char)]),
+    /// A symbol with multiple named variants, where some modifiers may have
+    /// been applied. Also used for symbols defined at runtime by the user with
+    /// no modifier applied.
+    Modified(Arc<(List, EcoString)>),
 }
 
 /// A collection of symbols.
 #[derive(Clone, Eq, PartialEq, Hash)]
 enum List {
-    Static(&'static [(&'static str, SymChar)]),
-    Runtime(Box<[(EcoString, SymChar)]>),
+    Static(&'static [(&'static str, char)]),
+    Runtime(Box<[(EcoString, char)]>),
 }
 
 impl Symbol {
     /// Create a new symbol from a single character.
-    pub const fn single(c: SymChar) -> Self {
+    pub const fn single(c: char) -> Self {
         Self(Repr::Single(c))
     }
 
     /// Create a symbol with a static variant list.
     #[track_caller]
-    pub const fn list(list: &'static [(&'static str, SymChar)]) -> Self {
+    pub const fn list(list: &'static [(&'static str, char)]) -> Self {
         debug_assert!(!list.is_empty());
-        Self(Repr::Const(list))
+        Self(Repr::Complex(list))
     }
 
     /// Create a symbol with a runtime variant list.
     #[track_caller]
-    pub fn runtime(list: Box<[(EcoString, SymChar)]>) -> Self {
+    pub fn runtime(list: Box<[(EcoString, char)]>) -> Self {
         debug_assert!(!list.is_empty());
-        Self(Repr::Multi(Arc::new((List::Runtime(list), EcoString::new()))))
+        Self(Repr::Modified(Arc::new((List::Runtime(list), EcoString::new()))))
     }
 
-    /// Get the symbol's char.
+    /// Get the symbol's character.
     pub fn get(&self) -> char {
-        self.sym().char()
-    }
-
-    /// Resolve the symbol's `SymChar`.
-    pub fn sym(&self) -> SymChar {
         match &self.0 {
             Repr::Single(c) => *c,
-            Repr::Const(_) => find(self.variants(), "").unwrap(),
-            Repr::Multi(arc) => find(self.variants(), &arc.1).unwrap(),
+            Repr::Complex(_) => find(self.variants(), "").unwrap(),
+            Repr::Modified(arc) => find(self.variants(), &arc.1).unwrap(),
         }
     }
 
     /// Try to get the function associated with the symbol, if any.
     pub fn func(&self) -> StrResult<Func> {
-        self.sym()
-            .func()
-            .ok_or_else(|| eco_format!("symbol {self} is not callable"))
+        match self.get() {
+            '⌈' => Ok(crate::math::ceil::func()),
+            '⌊' => Ok(crate::math::floor::func()),
+            '–' => Ok(crate::math::accent::dash::func()),
+            '⋅' | '\u{0307}' => Ok(crate::math::accent::dot::func()),
+            '¨' => Ok(crate::math::accent::dot_double::func()),
+            '\u{20db}' => Ok(crate::math::accent::dot_triple::func()),
+            '\u{20dc}' => Ok(crate::math::accent::dot_quad::func()),
+            '∼' => Ok(crate::math::accent::tilde::func()),
+            '´' => Ok(crate::math::accent::acute::func()),
+            '˝' => Ok(crate::math::accent::acute_double::func()),
+            '˘' => Ok(crate::math::accent::breve::func()),
+            'ˇ' => Ok(crate::math::accent::caron::func()),
+            '^' => Ok(crate::math::accent::hat::func()),
+            '`' => Ok(crate::math::accent::grave::func()),
+            '¯' => Ok(crate::math::accent::macron::func()),
+            '○' => Ok(crate::math::accent::circle::func()),
+            '→' => Ok(crate::math::accent::arrow::func()),
+            '←' => Ok(crate::math::accent::arrow_l::func()),
+            '↔' => Ok(crate::math::accent::arrow_l_r::func()),
+            '⇀' => Ok(crate::math::accent::harpoon::func()),
+            '↼' => Ok(crate::math::accent::harpoon_lt::func()),
+            _ => bail!("symbol {self} is not callable"),
+        }
     }
 
     /// Apply a modifier to the symbol.
     pub fn modified(mut self, modifier: &str) -> StrResult<Self> {
-        if let Repr::Const(list) = self.0 {
-            self.0 = Repr::Multi(Arc::new((List::Static(list), EcoString::new())));
+        if let Repr::Complex(list) = self.0 {
+            self.0 = Repr::Modified(Arc::new((List::Static(list), EcoString::new())));
         }
 
-        if let Repr::Multi(arc) = &mut self.0 {
+        if let Repr::Modified(arc) = &mut self.0 {
             let (list, modifiers) = Arc::make_mut(arc);
             if !modifiers.is_empty() {
                 modifiers.push('.');
@@ -127,11 +146,11 @@ impl Symbol {
     }
 
     /// The characters that are covered by this symbol.
-    pub fn variants(&self) -> impl Iterator<Item = (&str, SymChar)> {
+    pub fn variants(&self) -> impl Iterator<Item = (&str, char)> {
         match &self.0 {
             Repr::Single(c) => Variants::Single(Some(*c).into_iter()),
-            Repr::Const(list) => Variants::Static(list.iter()),
-            Repr::Multi(arc) => arc.0.variants(),
+            Repr::Complex(list) => Variants::Static(list.iter()),
+            Repr::Modified(arc) => arc.0.variants(),
         }
     }
 
@@ -139,7 +158,7 @@ impl Symbol {
     pub fn modifiers(&self) -> impl Iterator<Item = &str> + '_ {
         let mut set = BTreeSet::new();
         let modifiers = match &self.0 {
-            Repr::Multi(arc) => arc.1.as_str(),
+            Repr::Modified(arc) => arc.1.as_str(),
             _ => "",
         };
         for modifier in self.variants().flat_map(|(name, _)| name.split('.')) {
@@ -172,7 +191,6 @@ impl Symbol {
     /// ```
     #[func(constructor)]
     pub fn construct(
-        /// The callsite span.
         span: Span,
         /// The variants of the symbol.
         ///
@@ -184,17 +202,62 @@ impl Symbol {
         #[variadic]
         variants: Vec<Spanned<SymbolVariant>>,
     ) -> SourceResult<Symbol> {
-        let mut list = Vec::new();
         if variants.is_empty() {
             bail!(span, "expected at least one variant");
         }
-        for Spanned { v, span } in variants {
-            if list.iter().any(|(prev, _)| &v.0 == prev) {
-                bail!(span, "duplicate variant");
+
+        // Maps from canonicalized 128-bit hashes to indices of variants we've
+        // seen before.
+        let mut seen = HashMap::<u128, usize>::new();
+
+        // A list of modifiers, cleared & reused in each iteration.
+        let mut modifiers = Vec::new();
+
+        // Validate the variants.
+        for (i, &Spanned { ref v, span }) in variants.iter().enumerate() {
+            modifiers.clear();
+
+            if !v.0.is_empty() {
+                // Collect all modifiers.
+                for modifier in v.0.split('.') {
+                    if !is_ident(modifier) {
+                        bail!(span, "invalid symbol modifier: {}", modifier.repr());
+                    }
+                    modifiers.push(modifier);
+                }
             }
-            list.push((v.0, SymChar::pure(v.1)));
+
+            // Canonicalize the modifier order.
+            modifiers.sort();
+
+            // Ensure that there are no duplicate modifiers.
+            if let Some(ms) = modifiers.windows(2).find(|ms| ms[0] == ms[1]) {
+                bail!(
+                    span, "duplicate modifier within variant: {}", ms[0].repr();
+                    hint: "modifiers are not ordered, so each one may appear only once"
+                )
+            }
+
+            // Check whether we had this set of modifiers before.
+            let hash = hash128(&modifiers);
+            if let Some(&i) = seen.get(&hash) {
+                if v.0.is_empty() {
+                    bail!(span, "duplicate default variant");
+                } else if v.0 == variants[i].v.0 {
+                    bail!(span, "duplicate variant: {}", v.0.repr());
+                } else {
+                    bail!(
+                        span, "duplicate variant: {}", v.0.repr();
+                        hint: "variants with the same modifiers are identical, regardless of their order"
+                    )
+                }
+            }
+
+            seen.insert(hash, i);
         }
-        Ok(Symbol::runtime(list.into_boxed_slice()))
+
+        let list = variants.into_iter().map(|s| (s.v.0, s.v.1)).collect();
+        Ok(Symbol::runtime(list))
     }
 }
 
@@ -204,40 +267,12 @@ impl Display for Symbol {
     }
 }
 
-impl SymChar {
-    /// Create a symbol character without a function.
-    pub const fn pure(c: char) -> Self {
-        Self(c, None)
-    }
-
-    /// Create a symbol character with a function.
-    pub const fn with_func(c: char, func: fn() -> Func) -> Self {
-        Self(c, Some(func))
-    }
-
-    /// Get the character of the symbol.
-    pub const fn char(&self) -> char {
-        self.0
-    }
-
-    /// Get the function associated with the symbol.
-    pub fn func(&self) -> Option<Func> {
-        self.1.map(|f| f())
-    }
-}
-
-impl From<char> for SymChar {
-    fn from(c: char) -> Self {
-        SymChar(c, None)
-    }
-}
-
 impl Debug for Repr {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         match self {
             Self::Single(c) => Debug::fmt(c, f),
-            Self::Const(list) => list.fmt(f),
-            Self::Multi(lists) => lists.fmt(f),
+            Self::Complex(list) => list.fmt(f),
+            Self::Modified(lists) => lists.fmt(f),
         }
     }
 }
@@ -253,8 +288,48 @@ impl Debug for List {
 
 impl crate::foundations::Repr for Symbol {
     fn repr(&self) -> EcoString {
-        eco_format!("\"{}\"", self.get())
+        match &self.0 {
+            Repr::Single(c) => eco_format!("symbol(\"{}\")", *c),
+            Repr::Complex(variants) => {
+                eco_format!("symbol{}", repr_variants(variants.iter().copied(), ""))
+            }
+            Repr::Modified(arc) => {
+                let (list, modifiers) = arc.as_ref();
+                if modifiers.is_empty() {
+                    eco_format!("symbol{}", repr_variants(list.variants(), ""))
+                } else {
+                    eco_format!("symbol{}", repr_variants(list.variants(), modifiers))
+                }
+            }
+        }
     }
+}
+
+fn repr_variants<'a>(
+    variants: impl Iterator<Item = (&'a str, char)>,
+    applied_modifiers: &str,
+) -> String {
+    crate::foundations::repr::pretty_array_like(
+        &variants
+            .filter(|(variant, _)| {
+                // Only keep variants that can still be accessed, i.e., variants
+                // that contain all applied modifiers.
+                parts(applied_modifiers).all(|am| variant.split('.').any(|m| m == am))
+            })
+            .map(|(variant, c)| {
+                let trimmed_variant = variant
+                    .split('.')
+                    .filter(|&m| parts(applied_modifiers).all(|am| m != am));
+                if trimmed_variant.clone().all(|m| m.is_empty()) {
+                    eco_format!("\"{c}\"")
+                } else {
+                    let trimmed_modifiers = trimmed_variant.collect::<Vec<_>>().join(".");
+                    eco_format!("(\"{}\", \"{}\")", trimmed_modifiers, c)
+                }
+            })
+            .collect::<Vec<_>>(),
+        false,
+    )
 }
 
 impl Serialize for Symbol {
@@ -286,20 +361,20 @@ cast! {
         let mut iter = array.into_iter();
         match (iter.next(), iter.next(), iter.next()) {
             (Some(a), Some(b), None) => Self(a.cast()?, b.cast()?),
-            _ => Err("point array must contain exactly two entries")?,
+            _ => Err("variant array must contain exactly two entries")?,
         }
     },
 }
 
 /// Iterator over variants.
 enum Variants<'a> {
-    Single(std::option::IntoIter<SymChar>),
-    Static(std::slice::Iter<'static, (&'static str, SymChar)>),
-    Runtime(std::slice::Iter<'a, (EcoString, SymChar)>),
+    Single(std::option::IntoIter<char>),
+    Static(std::slice::Iter<'static, (&'static str, char)>),
+    Runtime(std::slice::Iter<'a, (EcoString, char)>),
 }
 
 impl<'a> Iterator for Variants<'a> {
-    type Item = (&'a str, SymChar);
+    type Item = (&'a str, char);
 
     fn next(&mut self) -> Option<Self::Item> {
         match self {
@@ -312,9 +387,9 @@ impl<'a> Iterator for Variants<'a> {
 
 /// Find the best symbol from the list.
 fn find<'a>(
-    variants: impl Iterator<Item = (&'a str, SymChar)>,
+    variants: impl Iterator<Item = (&'a str, char)>,
     modifiers: &str,
-) -> Option<SymChar> {
+) -> Option<char> {
     let mut best = None;
     let mut best_score = None;
 
@@ -336,7 +411,7 @@ fn find<'a>(
         }
 
         let score = (matching, Reverse(total));
-        if best_score.map_or(true, |b| score > b) {
+        if best_score.is_none_or(|b| score > b) {
             best = Some(candidate.1);
             best_score = Some(score);
         }
@@ -353,4 +428,32 @@ fn parts(modifiers: &str) -> impl Iterator<Item = &str> {
 /// Whether the modifier string contains the modifier `m`.
 fn contained(modifiers: &str, m: &str) -> bool {
     parts(modifiers).any(|part| part == m)
+}
+
+/// A single character.
+#[elem(Repr, PlainText)]
+pub struct SymbolElem {
+    /// The symbol's character.
+    #[required]
+    pub text: char, // This is called `text` for consistency with `TextElem`.
+}
+
+impl SymbolElem {
+    /// Create a new packed symbol element.
+    pub fn packed(text: impl Into<char>) -> Content {
+        Self::new(text.into()).pack()
+    }
+}
+
+impl PlainText for Packed<SymbolElem> {
+    fn plain_text(&self, text: &mut EcoString) {
+        text.push(self.text);
+    }
+}
+
+impl crate::foundations::Repr for SymbolElem {
+    /// Use a custom repr that matches normal content.
+    fn repr(&self) -> EcoString {
+        eco_format!("[{}]", self.text)
+    }
 }

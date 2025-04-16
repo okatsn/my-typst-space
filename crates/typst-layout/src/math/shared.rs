@@ -2,7 +2,6 @@ use ttf_parser::math::MathValue;
 use typst_library::foundations::{Style, StyleChain};
 use typst_library::layout::{Abs, Em, FixedAlignment, Frame, Point, Size, VAlignment};
 use typst_library::math::{EquationElem, MathSize};
-use typst_library::text::TextElem;
 use typst_utils::LazyHash;
 
 use super::{LeftRightAlternator, MathContext, MathFragment, MathRun};
@@ -18,7 +17,7 @@ macro_rules! scaled {
         $crate::math::Scaled::scaled(
             $ctx.constants.$name(),
             $ctx,
-            $crate::math::scaled_font_size($ctx, $styles),
+            typst_library::text::TextElem::size_in($styles),
         )
     };
 }
@@ -55,16 +54,6 @@ impl Scaled for MathValue<'_> {
     }
 }
 
-/// Get the font size scaled with the `MathSize`.
-pub fn scaled_font_size(ctx: &MathContext, styles: StyleChain) -> Abs {
-    let factor = match EquationElem::size_in(styles) {
-        MathSize::Display | MathSize::Text => 1.0,
-        MathSize::Script => percent!(ctx, script_percent_scale_down),
-        MathSize::ScriptScript => percent!(ctx, script_script_percent_scale_down),
-    };
-    factor * TextElem::size_in(styles)
-}
-
 /// Styles something as cramped.
 pub fn style_cramped() -> LazyHash<Style> {
     EquationElem::set_cramped(true).wrap()
@@ -99,6 +88,15 @@ pub fn style_for_denominator(styles: StyleChain) -> [LazyHash<Style>; 2] {
     [style_for_numerator(styles), EquationElem::set_cramped(true).wrap()]
 }
 
+/// Styles to add font constants to the style chain.
+pub fn style_for_script_scale(ctx: &MathContext) -> LazyHash<Style> {
+    EquationElem::set_script_scale((
+        ctx.constants.script_percent_scale_down(),
+        ctx.constants.script_script_percent_scale_down(),
+    ))
+    .wrap()
+}
+
 /// How a delimieter should be aligned when scaling.
 pub fn delimiter_alignment(delimiter: char) -> VAlignment {
     match delimiter {
@@ -119,22 +117,16 @@ pub fn stack(
     gap: Abs,
     baseline: usize,
     alternator: LeftRightAlternator,
-    minimum_ascent_descent: Option<(Abs, Abs)>,
 ) -> Frame {
-    let rows: Vec<_> = rows.into_iter().flat_map(|r| r.rows()).collect();
     let AlignmentResult { points, width } = alignments(&rows);
     let rows: Vec<_> = rows
         .into_iter()
         .map(|row| row.into_line_frame(&points, alternator))
         .collect();
 
-    let padded_height = |height: Abs| {
-        height.max(minimum_ascent_descent.map_or(Abs::zero(), |(a, d)| a + d))
-    };
-
     let mut frame = Frame::soft(Size::new(
         width,
-        rows.iter().map(|row| padded_height(row.height())).sum::<Abs>()
+        rows.iter().map(|row| row.height()).sum::<Abs>()
             + rows.len().saturating_sub(1) as f64 * gap,
     ));
 
@@ -145,14 +137,11 @@ pub fn stack(
         } else {
             Abs::zero()
         };
-        let ascent_padded_part = minimum_ascent_descent
-            .map_or(Abs::zero(), |(a, _)| (a - row.ascent()))
-            .max(Abs::zero());
-        let pos = Point::new(x, y + ascent_padded_part);
+        let pos = Point::new(x, y);
         if i == baseline {
-            frame.set_baseline(y + row.baseline() + ascent_padded_part);
+            frame.set_baseline(y + row.baseline());
         }
-        y += padded_height(row.height()) + gap;
+        y += row.height() + gap;
         frame.push_frame(pos, row);
     }
 

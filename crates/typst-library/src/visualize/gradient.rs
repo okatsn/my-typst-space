@@ -70,6 +70,9 @@ use crate::visualize::{Color, ColorSpace, WeightedColor};
 /// the offsets when defining a gradient. In this case, Typst will space all
 /// stops evenly.
 ///
+/// Typst predefines color maps that you can use as stops. See the
+/// [`color`]($color/#predefined-color-maps) documentation for more details.
+///
 /// # Relativeness
 /// The location of the `{0%}` and `{100%}` stops depends on the dimensions
 /// of a container. This container can either be the shape that it is being
@@ -117,12 +120,12 @@ use crate::visualize::{Color, ColorSpace, WeightedColor};
 /// #let spaces = (
 ///   ("Oklab", color.oklab),
 ///   ("Oklch", color.oklch),
-///   ("linear-RGB", color.linear-rgb),
 ///   ("sRGB", color.rgb),
+///   ("linear-RGB", color.linear-rgb),
 ///   ("CMYK", color.cmyk),
+///   ("Grayscale", color.luma),
 ///   ("HSL", color.hsl),
 ///   ("HSV", color.hsv),
-///   ("Grayscale", color.luma),
 /// )
 ///
 /// #for (name, space) in spaces {
@@ -156,10 +159,6 @@ use crate::visualize::{Color, ColorSpace, WeightedColor};
 ///   square(fill: gradient.linear(red, blue, angle: 270deg)),
 /// )
 /// ```
-///
-/// # Presets
-/// Typst predefines color maps that you can use with your gradients. See the
-/// [`color`]($color/#predefined-color-maps) documentation for more details.
 ///
 /// # Note on file sizes
 ///
@@ -200,9 +199,7 @@ impl Gradient {
     /// ```
     #[func(title = "Linear Gradient")]
     pub fn linear(
-        /// The args of this function.
         args: &mut Args,
-        /// The call site of this function.
         span: Span,
         /// The color [stops](#stops) of the gradient.
         #[variadic]
@@ -290,9 +287,8 @@ impl Gradient {
     ///   )),
     /// )
     /// ```
-    #[func]
+    #[func(title = "Radial Gradient")]
     fn radial(
-        /// The call site of this function.
         span: Span,
         /// The color [stops](#stops) of the gradient.
         #[variadic]
@@ -405,9 +401,8 @@ impl Gradient {
     ///   )),
     /// )
     /// ```
-    #[func]
+    #[func(title = "Conic Gradient")]
     pub fn conic(
-        /// The call site of this function.
         span: Span,
         /// The color [stops](#stops) of the gradient.
         #[variadic]
@@ -579,19 +574,17 @@ impl Gradient {
         }
 
         let n = repetitions.v;
-        let mut stops = std::iter::repeat(self.stops_ref())
-            .take(n)
+        let mut stops = std::iter::repeat_n(self.stops_ref(), n)
             .enumerate()
             .flat_map(|(i, stops)| {
                 let mut stops = stops
                     .iter()
                     .map(move |&(color, offset)| {
-                        let t = i as f64 / n as f64;
                         let r = offset.get();
                         if i % 2 == 1 && mirror {
-                            (color, Ratio::new(t + (1.0 - r) / n as f64))
+                            (color, Ratio::new((i as f64 + 1.0 - r) / n as f64))
                         } else {
-                            (color, Ratio::new(t + r / n as f64))
+                            (color, Ratio::new((i as f64 + r) / n as f64))
                         }
                     })
                     .collect::<Vec<_>>();
@@ -697,12 +690,62 @@ impl Gradient {
     }
 
     /// Returns the angle of this gradient.
+    ///
+    /// Returns `{none}` if the gradient is neither linear nor conic.
     #[func]
     pub fn angle(&self) -> Option<Angle> {
         match self {
             Self::Linear(linear) => Some(linear.angle),
             Self::Radial(_) => None,
             Self::Conic(conic) => Some(conic.angle),
+        }
+    }
+
+    /// Returns the center of this gradient.
+    ///
+    /// Returns `{none}` if the gradient is neither radial nor conic.
+    #[func]
+    pub fn center(&self) -> Option<Axes<Ratio>> {
+        match self {
+            Self::Linear(_) => None,
+            Self::Radial(radial) => Some(radial.center),
+            Self::Conic(conic) => Some(conic.center),
+        }
+    }
+
+    /// Returns the radius of this gradient.
+    ///
+    /// Returns `{none}` if the gradient is not radial.
+    #[func]
+    pub fn radius(&self) -> Option<Ratio> {
+        match self {
+            Self::Linear(_) => None,
+            Self::Radial(radial) => Some(radial.radius),
+            Self::Conic(_) => None,
+        }
+    }
+
+    /// Returns the focal-center of this gradient.
+    ///
+    /// Returns `{none}` if the gradient is not radial.
+    #[func]
+    pub fn focal_center(&self) -> Option<Axes<Ratio>> {
+        match self {
+            Self::Linear(_) => None,
+            Self::Radial(radial) => Some(radial.focal_center),
+            Self::Conic(_) => None,
+        }
+    }
+
+    /// Returns the focal-radius of this gradient.
+    ///
+    /// Returns `{none}` if the gradient is not radial.
+    #[func]
+    pub fn focal_radius(&self) -> Option<Ratio> {
+        match self {
+            Self::Linear(_) => None,
+            Self::Radial(radial) => Some(radial.focal_radius),
+            Self::Conic(_) => None,
         }
     }
 
@@ -1184,7 +1227,7 @@ fn process_stops(stops: &[Spanned<GradientStop>]) -> SourceResult<Vec<(Color, Ra
             };
 
             if stop.get() < last_stop {
-                bail!(*span, "offsets must be in strictly monotonic order");
+                bail!(*span, "offsets must be in monotonic order");
             }
 
             last_stop = stop.get();

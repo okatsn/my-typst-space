@@ -11,6 +11,7 @@ use typst_library::text::{
     LinebreakElem, RawContent, RawElem, SmartQuoteElem, SpaceElem, TextElem,
 };
 use typst_syntax::ast::{self, AstNode};
+use typst_utils::PicoStr;
 
 use crate::{Eval, Vm};
 
@@ -32,7 +33,7 @@ fn eval_markup<'a>(
 
     while let Some(expr) = exprs.next() {
         match expr {
-            ast::Expr::Set(set) => {
+            ast::Expr::SetRule(set) => {
                 let styles = set.eval(vm)?;
                 if vm.flow.is_some() {
                     break;
@@ -40,7 +41,7 @@ fn eval_markup<'a>(
 
                 seq.push(eval_markup(vm, exprs)?.styled_with_map(styles))
             }
-            ast::Expr::Show(show) => {
+            ast::Expr::ShowRule(show) => {
                 let recipe = show.eval(vm)?;
                 if vm.flow.is_some() {
                     break;
@@ -122,7 +123,7 @@ impl Eval for ast::Escape<'_> {
     type Output = Value;
 
     fn eval(self, _: &mut Vm) -> SourceResult<Self::Output> {
-        Ok(Value::Symbol(Symbol::single(self.get().into())))
+        Ok(Value::Symbol(Symbol::single(self.get())))
     }
 }
 
@@ -130,7 +131,7 @@ impl Eval for ast::Shorthand<'_> {
     type Output = Value;
 
     fn eval(self, _: &mut Vm) -> SourceResult<Self::Output> {
-        Ok(Value::Symbol(Symbol::single(self.get().into())))
+        Ok(Value::Symbol(Symbol::single(self.get())))
     }
 }
 
@@ -204,7 +205,7 @@ impl Eval for ast::Label<'_> {
     type Output = Value;
 
     fn eval(self, _: &mut Vm) -> SourceResult<Self::Output> {
-        Ok(Value::Label(Label::new(self.get())))
+        Ok(Value::Label(Label::new(PicoStr::intern(self.get()))))
     }
 }
 
@@ -212,7 +213,7 @@ impl Eval for ast::Ref<'_> {
     type Output = Content;
 
     fn eval(self, vm: &mut Vm) -> SourceResult<Self::Output> {
-        let target = Label::new(self.target());
+        let target = Label::new(PicoStr::intern(self.target()));
         let mut elem = RefElem::new(target);
         if let Some(supplement) = self.supplement() {
             elem.push_supplement(Smart::Custom(Some(Supplement::Content(

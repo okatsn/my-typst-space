@@ -3,74 +3,19 @@ use std::fmt::{self, Debug, Formatter};
 use std::hash::{Hash, Hasher};
 use std::{mem, ptr};
 
-use comemo::{Track, Tracked};
+use comemo::Tracked;
 use ecow::{eco_vec, EcoString, EcoVec};
 use smallvec::SmallVec;
 use typst_syntax::Span;
 use typst_utils::LazyHash;
 
-use crate::diag::{warning, SourceResult, Trace, Tracepoint};
+use crate::diag::{SourceResult, Trace, Tracepoint};
 use crate::engine::Engine;
 use crate::foundations::{
-    cast, elem, func, ty, Content, Context, Element, Func, NativeElement, Packed, Repr,
-    Selector, Show,
+    cast, ty, Content, Context, Element, Func, NativeElement, OneOrMultiple, Repr,
+    Selector,
 };
-use crate::introspection::Locatable;
 use crate::text::{FontFamily, FontList, TextElem};
-
-/// Provides access to active styles.
-///
-/// **Deprecation planned.** Use [context] instead.
-///
-/// ```example
-/// #let thing(body) = style(styles => {
-///   let size = measure(body, styles)
-///   [Width of "#body" is #size.width]
-/// })
-///
-/// #thing[Hey] \
-/// #thing[Welcome]
-/// ```
-#[func]
-pub fn style(
-    /// The engine.
-    engine: &mut Engine,
-    /// The call site span.
-    span: Span,
-    /// A function to call with the styles. Its return value is displayed
-    /// in the document.
-    ///
-    /// This function is called once for each time the content returned by
-    /// `style` appears in the document. That makes it possible to generate
-    /// content that depends on the style context it appears in.
-    func: Func,
-) -> Content {
-    engine.sink.warn(warning!(
-        span, "`style` is deprecated";
-        hint: "use a `context` expression instead"
-    ));
-
-    StyleElem::new(func).pack().spanned(span)
-}
-
-/// Executes a style access.
-#[elem(Locatable, Show)]
-struct StyleElem {
-    /// The function to call with the styles.
-    #[required]
-    func: Func,
-}
-
-impl Show for Packed<StyleElem> {
-    #[typst_macros::time(name = "style", span = self.span())]
-    fn show(&self, engine: &mut Engine, styles: StyleChain) -> SourceResult<Content> {
-        let context = Context::new(self.location(), Some(styles));
-        Ok(self
-            .func()
-            .call(engine, context.track(), [styles.to_map()])?
-            .display())
-    }
-}
 
 /// A list of style properties.
 #[ty(cast)]
@@ -526,7 +471,8 @@ impl Debug for Recipe {
             selector.fmt(f)?;
             f.write_str(", ")?;
         }
-        self.transform.fmt(f)
+        self.transform.fmt(f)?;
+        f.write_str(")")
     }
 }
 
@@ -831,107 +777,6 @@ impl<'a> Iterator for Links<'a> {
     }
 }
 
-/// A sequence of elements with associated styles.
-#[derive(Clone, PartialEq, Hash)]
-pub struct StyleVec {
-    /// The elements themselves.
-    elements: EcoVec<Content>,
-    /// A run-length encoded list of style lists.
-    ///
-    /// Each element is a (styles, count) pair. Any elements whose
-    /// style falls after the end of this list is considered to
-    /// have an empty style list.
-    styles: EcoVec<(Styles, usize)>,
-}
-
-impl StyleVec {
-    /// Create a style vector from an unstyled vector content.
-    pub fn wrap(elements: EcoVec<Content>) -> Self {
-        Self { elements, styles: EcoVec::new() }
-    }
-
-    /// Create a `StyleVec` from a list of content with style chains.
-    pub fn create<'a>(buf: &[(&'a Content, StyleChain<'a>)]) -> (Self, StyleChain<'a>) {
-        let trunk = StyleChain::trunk(buf.iter().map(|&(_, s)| s)).unwrap_or_default();
-        let depth = trunk.links().count();
-
-        let mut elements = EcoVec::with_capacity(buf.len());
-        let mut styles = EcoVec::<(Styles, usize)>::new();
-        let mut last: Option<(StyleChain<'a>, usize)> = None;
-
-        for &(element, chain) in buf {
-            elements.push(element.clone());
-
-            if let Some((prev, run)) = &mut last {
-                if chain == *prev {
-                    *run += 1;
-                } else {
-                    styles.push((prev.suffix(depth), *run));
-                    last = Some((chain, 1));
-                }
-            } else {
-                last = Some((chain, 1));
-            }
-        }
-
-        if let Some((last, run)) = last {
-            let skippable = styles.is_empty() && last == trunk;
-            if !skippable {
-                styles.push((last.suffix(depth), run));
-            }
-        }
-
-        (StyleVec { elements, styles }, trunk)
-    }
-
-    /// Whether there are no elements.
-    pub fn is_empty(&self) -> bool {
-        self.elements.is_empty()
-    }
-
-    /// The number of elements.
-    pub fn len(&self) -> usize {
-        self.elements.len()
-    }
-
-    /// Iterate over the contained content and style chains.
-    pub fn iter<'a>(
-        &'a self,
-        outer: &'a StyleChain<'_>,
-    ) -> impl Iterator<Item = (&'a Content, StyleChain<'a>)> {
-        static EMPTY: Styles = Styles::new();
-        self.elements
-            .iter()
-            .zip(
-                self.styles
-                    .iter()
-                    .flat_map(|(local, count)| std::iter::repeat(local).take(*count))
-                    .chain(std::iter::repeat(&EMPTY)),
-            )
-            .map(|(element, local)| (element, outer.chain(local)))
-    }
-
-    /// Get a style property, but only if it is the same for all children of the
-    /// style vector.
-    pub fn shared_get<T: PartialEq>(
-        &self,
-        styles: StyleChain<'_>,
-        getter: fn(StyleChain) -> T,
-    ) -> Option<T> {
-        let value = getter(styles);
-        self.styles
-            .iter()
-            .all(|(local, _)| getter(styles.chain(local)) == value)
-            .then_some(value)
-    }
-}
-
-impl Debug for StyleVec {
-    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
-        f.debug_list().entries(&self.elements).finish()
-    }
-}
-
 /// A property that is resolved with other properties from the style chain.
 pub trait Resolve {
     /// The type of the resolved output.
@@ -991,6 +836,13 @@ impl<T> Fold for Vec<T> {
 impl<T, const N: usize> Fold for SmallVec<[T; N]> {
     fn fold(self, mut outer: Self) -> Self {
         outer.extend(self);
+        outer
+    }
+}
+
+impl<T> Fold for OneOrMultiple<T> {
+    fn fold(self, mut outer: Self) -> Self {
+        outer.0.extend(self.0);
         outer
     }
 }

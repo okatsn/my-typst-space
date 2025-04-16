@@ -22,7 +22,8 @@ use crate::layout::{BlockElem, Size};
 /// #let text = lorem(30)
 /// #layout(size => [
 ///   #let (height,) = measure(
-///     block(width: size.width, text),
+///     width: size.width,
+///     text,
 ///   )
 ///   This text is #height high with
 ///   the current page width: \
@@ -54,7 +55,6 @@ use crate::layout::{BlockElem, Size};
 /// corresponding page dimension is set to `{auto}`.
 #[func]
 pub fn layout(
-    /// The call span of this function.
     span: Span,
     /// A function to call with the outer container's size. Its return value is
     /// displayed in the document.
@@ -89,7 +89,7 @@ impl Show for Packed<LayoutElem> {
                 let loc = elem.location().unwrap();
                 let context = Context::new(Some(loc), Some(styles));
                 let result = elem
-                    .func()
+                    .func
                     .call(
                         engine,
                         context.track(),

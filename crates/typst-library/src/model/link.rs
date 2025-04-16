@@ -1,20 +1,21 @@
 use std::ops::Deref;
 
 use ecow::{eco_format, EcoString};
-use smallvec::SmallVec;
 
-use crate::diag::{bail, At, SourceResult, StrResult};
+use crate::diag::{bail, warning, At, SourceResult, StrResult};
 use crate::engine::Engine;
 use crate::foundations::{
-    cast, elem, Content, Label, Packed, Repr, Show, Smart, StyleChain,
+    cast, elem, Content, Label, NativeElement, Packed, Repr, Show, ShowSet, Smart,
+    StyleChain, Styles, TargetElem,
 };
+use crate::html::{attr, tag, HtmlElem};
 use crate::introspection::Location;
 use crate::layout::Position;
-use crate::text::{Hyphenate, TextElem};
+use crate::text::TextElem;
 
 /// Links to a URL or a location in the document.
 ///
-/// By default, links are not styled any different from normal text. However,
+/// By default, links do not look any different from normal text. However,
 /// you can easily apply a style of your choice with a show rule.
 ///
 /// # Example
@@ -28,6 +29,11 @@ use crate::text::{Hyphenate, TextElem};
 ///   See example.com
 /// ]
 /// ```
+///
+/// # Hyphenation
+/// If you enable hyphenation or justification, by default, it will not apply to
+/// links to prevent unwanted hyphenation in URLs. You can opt out of this
+/// default via `{show link: set text(hyphenate: true)}`.
 ///
 /// # Syntax
 /// This function also has dedicated syntax: Text that starts with `http://` or
@@ -83,10 +89,10 @@ pub struct LinkElem {
     })]
     pub body: Content,
 
-    /// This style is set on the content contained in the `link` element.
+    /// A destination style that should be applied to elements.
     #[internal]
     #[ghost]
-    pub dests: SmallVec<[Destination; 1]>,
+    pub current: Option<Destination>,
 }
 
 impl LinkElem {
@@ -99,26 +105,49 @@ impl LinkElem {
 
 impl Show for Packed<LinkElem> {
     #[typst_macros::time(name = "link", span = self.span())]
-    fn show(&self, engine: &mut Engine, _: StyleChain) -> SourceResult<Content> {
-        let body = self.body().clone();
-        let linked = match self.dest() {
-            LinkTarget::Dest(dest) => body.linked(dest.clone()),
-            LinkTarget::Label(label) => {
-                let elem = engine.introspector.query_label(*label).at(self.span())?;
-                let dest = Destination::Location(elem.location().unwrap());
-                body.clone().linked(dest)
-            }
-        };
+    fn show(&self, engine: &mut Engine, styles: StyleChain) -> SourceResult<Content> {
+        let body = self.body.clone();
 
-        Ok(linked.styled(TextElem::set_hyphenate(Hyphenate(Smart::Custom(false)))))
+        Ok(if TargetElem::target_in(styles).is_html() {
+            if let LinkTarget::Dest(Destination::Url(url)) = &self.dest {
+                HtmlElem::new(tag::a)
+                    .with_attr(attr::href, url.clone().into_inner())
+                    .with_body(Some(body))
+                    .pack()
+                    .spanned(self.span())
+            } else {
+                engine.sink.warn(warning!(
+                    self.span(),
+                    "non-URL links are not yet supported by HTML export"
+                ));
+                body
+            }
+        } else {
+            match &self.dest {
+                LinkTarget::Dest(dest) => body.linked(dest.clone()),
+                LinkTarget::Label(label) => {
+                    let elem = engine.introspector.query_label(*label).at(self.span())?;
+                    let dest = Destination::Location(elem.location().unwrap());
+                    body.clone().linked(dest)
+                }
+            }
+        })
+    }
+}
+
+impl ShowSet for Packed<LinkElem> {
+    fn show_set(&self, _: StyleChain) -> Styles {
+        let mut out = Styles::new();
+        out.set(TextElem::set_hyphenate(Smart::Custom(false)));
+        out
     }
 }
 
 fn body_from_url(url: &Url) -> Content {
-    let mut text = url.as_str();
-    for prefix in ["mailto:", "tel:"] {
-        text = text.trim_start_matches(prefix);
-    }
+    let text = ["mailto:", "tel:"]
+        .into_iter()
+        .find_map(|prefix| url.strip_prefix(prefix))
+        .unwrap_or(url);
     let shorter = text.len() < url.len();
     TextElem::packed(if shorter { text.into() } else { (**url).clone() })
 }

@@ -10,19 +10,19 @@ use typst_utils::LazyHash;
 use crate::diag::SourceResult;
 use crate::engine::{Engine, Route, Sink, Traced};
 use crate::foundations::{
-    Args, Cast, Closure, Content, Context, Func, Packed, Scope, StyleChain, StyleVec,
-    Styles, Value,
+    Args, Cast, Closure, Content, Context, Func, Packed, Scope, StyleChain, Styles, Value,
 };
 use crate::introspection::{Introspector, Locator, SplitLocator};
 use crate::layout::{
     Abs, BoxElem, ColumnsElem, Fragment, Frame, GridElem, InlineItem, MoveElem, PadElem,
-    Region, Regions, Rel, RepeatElem, RotateElem, ScaleElem, Size, SkewElem, StackElem,
+    PagedDocument, Region, Regions, Rel, RepeatElem, RotateElem, ScaleElem, Size,
+    SkewElem, StackElem,
 };
 use crate::math::EquationElem;
-use crate::model::{Document, DocumentInfo, EnumElem, ListElem, TableElem};
+use crate::model::{DocumentInfo, EnumElem, ListElem, TableElem};
 use crate::visualize::{
-    CircleElem, EllipseElem, ImageElem, LineElem, PathElem, PolygonElem, RectElem,
-    SquareElem,
+    CircleElem, CurveElem, EllipseElem, ImageElem, LineElem, PathElem, PolygonElem,
+    RectElem, SquareElem,
 };
 use crate::World;
 
@@ -55,6 +55,7 @@ routines! {
     fn eval_string(
         routines: &Routines,
         world: Tracked<dyn World + '_>,
+        sink: TrackedMut<Sink>,
         string: &str,
         span: Span,
         mode: EvalMode,
@@ -85,13 +86,6 @@ routines! {
         styles: StyleChain<'a>,
     ) -> SourceResult<Vec<Pair<'a>>>
 
-    /// Layout content into a document.
-    fn layout_document(
-        engine: &mut Engine,
-        content: &Content,
-        styles: StyleChain,
-    ) -> SourceResult<Document>
-
     /// Lays out content into multiple regions.
     fn layout_fragment(
         engine: &mut Engine,
@@ -108,26 +102,6 @@ routines! {
         locator: Locator,
         styles: StyleChain,
         region: Region,
-    ) -> SourceResult<Frame>
-
-    /// Lays out inline content.
-    fn layout_inline(
-        engine: &mut Engine,
-        children: &StyleVec,
-        locator: Locator,
-        styles: StyleChain,
-        consecutive: bool,
-        region: Size,
-        expand: bool,
-    ) -> SourceResult<Fragment>
-
-    /// Lays out a [`BoxElem`].
-    fn layout_box(
-        elem: &Packed<BoxElem>,
-        engine: &mut Engine,
-        locator: Locator,
-        styles: StyleChain,
-        region: Size,
     ) -> SourceResult<Frame>
 
     /// Lays out a [`ListElem`].
@@ -247,6 +221,15 @@ routines! {
         region: Region,
     ) -> SourceResult<Frame>
 
+    /// Lays out a [`CurveElem`].
+    fn layout_curve(
+        elem: &Packed<CurveElem>,
+        _: &mut Engine,
+        _: Locator,
+        styles: StyleChain,
+        region: Region,
+    ) -> SourceResult<Frame>
+
     /// Lays out a [`PathElem`].
     fn layout_path(
         elem: &Packed<PathElem>,
@@ -342,13 +325,63 @@ pub enum EvalMode {
 
 /// Defines what kind of realization we are performing.
 pub enum RealizationKind<'a> {
-    /// This the root realization for the document. Requires a mutable reference
+    /// This the root realization for layout. Requires a mutable reference
     /// to document metadata that will be filled from `set document` rules.
-    Root(&'a mut DocumentInfo),
-    /// A nested realization in a container (e.g. a `block`).
-    Container,
+    LayoutDocument(&'a mut DocumentInfo),
+    /// A nested realization in a container (e.g. a `block`). Requires a mutable
+    /// reference to an enum that will be set to `FragmentKind::Inline` if the
+    /// fragment's content was fully inline.
+    LayoutFragment(&'a mut FragmentKind),
+    /// A nested realization in a paragraph (i.e. a `par`)
+    LayoutPar,
+    /// This the root realization for HTML. Requires a mutable reference
+    /// to document metadata that will be filled from `set document` rules.
+    HtmlDocument(&'a mut DocumentInfo),
+    /// A nested realization in a container (e.g. a `block`). Requires a mutable
+    /// reference to an enum that will be set to `FragmentKind::Inline` if the
+    /// fragment's content was fully inline.
+    HtmlFragment(&'a mut FragmentKind),
     /// A realization within math.
     Math,
+}
+
+impl RealizationKind<'_> {
+    /// It this a realization for HTML export?
+    pub fn is_html(&self) -> bool {
+        matches!(self, Self::HtmlDocument(_) | Self::HtmlFragment(_))
+    }
+
+    /// It this a realization for a container?
+    pub fn is_fragment(&self) -> bool {
+        matches!(self, Self::LayoutFragment(_) | Self::HtmlFragment(_))
+    }
+
+    /// If this is a document-level realization, accesses the document info.
+    pub fn as_document_mut(&mut self) -> Option<&mut DocumentInfo> {
+        match self {
+            Self::LayoutDocument(info) | Self::HtmlDocument(info) => Some(*info),
+            _ => None,
+        }
+    }
+
+    /// If this is a container-level realization, accesses the fragment kind.
+    pub fn as_fragment_mut(&mut self) -> Option<&mut FragmentKind> {
+        match self {
+            Self::LayoutFragment(kind) | Self::HtmlFragment(kind) => Some(*kind),
+            _ => None,
+        }
+    }
+}
+
+/// The kind of fragment output that realization produced.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+pub enum FragmentKind {
+    /// The fragment's contents were fully inline, and as a result, the output
+    /// elements are too.
+    Inline,
+    /// The fragment contained non-inline content, so inline content was forced
+    /// into paragraphs, and as a result, the output elements are not inline.
+    Block,
 }
 
 /// Temporary storage arenas for lifetime extension during realization.

@@ -1,12 +1,12 @@
 use typst_library::diag::SourceResult;
 use typst_library::engine::Engine;
 use typst_library::foundations::Resolve;
+use typst_library::layout::grid::resolve::Repeatable;
 use typst_library::layout::{Abs, Axes, Frame, Point, Region, Regions, Size, Sizing};
 use typst_utils::MaybeReverseIter;
 
 use super::layouter::{in_last_with_offset, points, Row, RowPiece};
-use super::repeated::Repeatable;
-use super::{Cell, GridLayouter};
+use super::{layout_cell, Cell, GridLayouter};
 
 /// All information needed to layout a single rowspan.
 pub struct Rowspan {
@@ -85,7 +85,7 @@ pub struct CellMeasurementData<'layouter> {
     pub frames_in_previous_regions: usize,
 }
 
-impl<'a> GridLayouter<'a> {
+impl GridLayouter<'_> {
     /// Layout a rowspan over the already finished regions, plus the current
     /// region's frame and resolved rows, if it wasn't finished yet (because
     /// we're being called from `finish_region`, but note that this function is
@@ -141,7 +141,7 @@ impl<'a> GridLayouter<'a> {
         }
 
         // Push the layouted frames directly into the finished frames.
-        let fragment = cell.layout(engine, disambiguator, self.styles, pod)?;
+        let fragment = layout_cell(cell, engine, disambiguator, self.styles, pod)?;
         let (current_region, current_rrows) = current_region_data.unzip();
         for ((i, finished), frame) in self
             .finished
@@ -588,7 +588,7 @@ impl<'a> GridLayouter<'a> {
         measurement_data: &CellMeasurementData<'_>,
     ) -> bool {
         if sizes.len() <= 1
-            && sizes.first().map_or(true, |&first_frame_size| {
+            && sizes.first().is_none_or(|&first_frame_size| {
                 first_frame_size <= measurement_data.height_in_this_region
             })
         {

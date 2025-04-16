@@ -6,13 +6,12 @@ use typst_library::diag::{
 };
 use typst_library::engine::{Engine, Sink, Traced};
 use typst_library::foundations::{
-    Arg, Args, Bytes, Capturer, Closure, Content, Context, Func, IntoValue,
-    NativeElement, Scope, Scopes, Value,
+    Arg, Args, Binding, Capturer, Closure, Content, Context, Func, NativeElement, Scope,
+    Scopes, SymbolElem, Value,
 };
 use typst_library::introspection::Introspector;
 use typst_library::math::LrElem;
 use typst_library::routines::Routines;
-use typst_library::text::TextElem;
 use typst_library::World;
 use typst_syntax::ast::{self, AstNode, Ident};
 use typst_syntax::{Span, Spanned, SyntaxNode};
@@ -197,7 +196,7 @@ pub fn eval_closure(
 
     // Provide the closure itself for recursive calls.
     if let Some(name) = name {
-        vm.define(name, Value::Func(func.clone()));
+        vm.define(name, func.clone());
     }
 
     let num_pos_args = args.to_pos().len();
@@ -253,8 +252,8 @@ pub fn eval_closure(
     // Handle control flow.
     let output = body.eval(&mut vm)?;
     match vm.flow {
-        Some(FlowEvent::Return(_, Some(explicit))) => return Ok(explicit),
-        Some(FlowEvent::Return(_, None)) => {}
+        Some(FlowEvent::Return(_, Some(explicit), _)) => return Ok(explicit),
+        Some(FlowEvent::Return(_, None, _)) => {}
         Some(flow) => bail!(flow.forbidden()),
         None => {}
     }
@@ -316,22 +315,25 @@ fn eval_field_call(
         (target, args)
     };
 
-    if let Value::Plugin(plugin) = &target {
-        // Call plugins by converting args to bytes.
-        let bytes = args.all::<Bytes>()?;
-        args.finish()?;
-        let value = plugin.call(&field, bytes).at(span)?.into_value();
-        Ok(FieldCall::Resolved(value))
-    } else if let Some(callee) = target.ty().scope().get(&field) {
+    let field_span = field.span();
+    let sink = (&mut vm.engine, field_span);
+    if let Some(callee) = target.ty().scope().get(&field) {
         args.insert(0, target_expr.span(), target);
-        Ok(FieldCall::Normal(callee.clone(), args))
+        Ok(FieldCall::Normal(callee.read_checked(sink).clone(), args))
+    } else if let Value::Content(content) = &target {
+        if let Some(callee) = content.elem().scope().get(&field) {
+            args.insert(0, target_expr.span(), target);
+            Ok(FieldCall::Normal(callee.read_checked(sink).clone(), args))
+        } else {
+            bail!(missing_field_call_error(target, field))
+        }
     } else if matches!(
         target,
         Value::Symbol(_) | Value::Func(_) | Value::Type(_) | Value::Module(_)
     ) {
         // Certain value types may have their own ways to access method fields.
         // e.g. `$arrow.r(v)$`, `table.cell[..]`
-        let value = target.field(&field).at(field.span())?;
+        let value = target.field(&field, sink).at(field_span)?;
         Ok(FieldCall::Normal(value, args))
     } else {
         // Otherwise we cannot call this field.
@@ -341,8 +343,20 @@ fn eval_field_call(
 
 /// Produce an error when we cannot call the field.
 fn missing_field_call_error(target: Value, field: Ident) -> SourceDiagnostic {
-    let mut error =
-        error!(field.span(), "type {} has no method `{}`", target.ty(), field.as_str());
+    let mut error = match &target {
+        Value::Content(content) => error!(
+            field.span(),
+            "element {} has no method `{}`",
+            content.elem().name(),
+            field.as_str(),
+        ),
+        _ => error!(
+            field.span(),
+            "type {} has no method `{}`",
+            target.ty(),
+            field.as_str()
+        ),
+    };
 
     match target {
         Value::Dict(ref dict) if matches!(dict.get(&field), Ok(Value::Func(_))) => {
@@ -352,7 +366,7 @@ fn missing_field_call_error(target: Value, field: Ident) -> SourceDiagnostic {
                 field.as_str(),
             ));
         }
-        _ if target.field(&field).is_ok() => {
+        _ if target.field(&field, ()).is_ok() => {
             error.hint(eco_format!(
                 "did you mean to access the field `{}`?",
                 field.as_str(),
@@ -360,6 +374,7 @@ fn missing_field_call_error(target: Value, field: Ident) -> SourceDiagnostic {
         }
         _ => {}
     }
+
     error
 }
 
@@ -382,16 +397,18 @@ fn wrap_args_in_math(
     let mut body = Content::empty();
     for (i, arg) in args.all::<Content>()?.into_iter().enumerate() {
         if i > 0 {
-            body += TextElem::packed(',');
+            body += SymbolElem::packed(',');
         }
         body += arg;
     }
     if trailing_comma {
-        body += TextElem::packed(',');
+        body += SymbolElem::packed(',');
     }
     Ok(Value::Content(
         callee.display().spanned(callee_span)
-            + LrElem::new(TextElem::packed('(') + body + TextElem::packed(')')).pack(),
+            + LrElem::new(SymbolElem::packed('(') + body + SymbolElem::packed(')'))
+                .pack()
+                .spanned(args.span),
     ))
 }
 
@@ -443,15 +460,13 @@ impl<'a> CapturesVisitor<'a> {
             // Identifiers that shouldn't count as captures because they
             // actually bind a new name are handled below (individually through
             // the expressions that contain them).
-            Some(ast::Expr::Ident(ident)) => {
-                self.capture(ident.get(), ident.span(), Scopes::get)
-            }
+            Some(ast::Expr::Ident(ident)) => self.capture(ident.get(), Scopes::get),
             Some(ast::Expr::MathIdent(ident)) => {
-                self.capture(ident.get(), ident.span(), Scopes::get_in_math)
+                self.capture(ident.get(), Scopes::get_in_math)
             }
 
             // Code and content blocks create a scope.
-            Some(ast::Expr::Code(_) | ast::Expr::Content(_)) => {
+            Some(ast::Expr::CodeBlock(_) | ast::Expr::ContentBlock(_)) => {
                 self.internal.enter();
                 for child in node.children() {
                     self.visit(child);
@@ -501,7 +516,7 @@ impl<'a> CapturesVisitor<'a> {
 
             // A let expression contains a binding, but that binding is only
             // active after the body is evaluated.
-            Some(ast::Expr::Let(expr)) => {
+            Some(ast::Expr::LetBinding(expr)) => {
                 if let Some(init) = expr.init() {
                     self.visit(init.to_untyped());
                 }
@@ -514,7 +529,7 @@ impl<'a> CapturesVisitor<'a> {
             // A for loop contains one or two bindings in its pattern. These are
             // active after the iterable is evaluated but before the body is
             // evaluated.
-            Some(ast::Expr::For(expr)) => {
+            Some(ast::Expr::ForLoop(expr)) => {
                 self.visit(expr.iterable().to_untyped());
                 self.internal.enter();
 
@@ -529,7 +544,7 @@ impl<'a> CapturesVisitor<'a> {
 
             // An import contains items, but these are active only after the
             // path is evaluated.
-            Some(ast::Expr::Import(expr)) => {
+            Some(ast::Expr::ModuleImport(expr)) => {
                 self.visit(expr.source().to_untyped());
                 if let Some(ast::Imports::Items(items)) = expr.imports() {
                     for item in items.iter() {
@@ -555,32 +570,34 @@ impl<'a> CapturesVisitor<'a> {
 
     /// Bind a new internal variable.
     fn bind(&mut self, ident: ast::Ident) {
-        self.internal.top.define_ident(ident, Value::None);
+        // The concrete value does not matter as we only use the scoping
+        // mechanism of `Scopes`, not the values themselves.
+        self.internal
+            .top
+            .bind(ident.get().clone(), Binding::detached(Value::None));
     }
 
     /// Capture a variable if it isn't internal.
     fn capture(
         &mut self,
         ident: &EcoString,
-        span: Span,
-        getter: impl FnOnce(&'a Scopes<'a>, &str) -> HintedStrResult<&'a Value>,
+        getter: impl FnOnce(&'a Scopes<'a>, &str) -> HintedStrResult<&'a Binding>,
     ) {
-        if self.internal.get(ident).is_err() {
-            let Some(value) = self
-                .external
-                .map(|external| getter(external, ident).ok())
-                .unwrap_or(Some(&Value::None))
-            else {
-                return;
-            };
-
-            self.captures.define_captured(
-                ident.clone(),
-                value.clone(),
-                self.capturer,
-                span,
-            );
+        if self.internal.get(ident).is_ok() {
+            return;
         }
+
+        let binding = match self.external {
+            Some(external) => match getter(external, ident) {
+                Ok(binding) => binding.capture(self.capturer),
+                Err(_) => return,
+            },
+            // The external scopes are only `None` when we are doing IDE capture
+            // analysis, in which case the concrete value doesn't matter.
+            None => Binding::detached(Value::None),
+        };
+
+        self.captures.bind(ident.clone(), binding);
     }
 }
 
@@ -591,14 +608,8 @@ mod tests {
     use super::*;
 
     #[track_caller]
-    fn test(text: &str, result: &[&str]) {
-        let mut scopes = Scopes::new(None);
-        scopes.top.define("f", 0);
-        scopes.top.define("x", 0);
-        scopes.top.define("y", 0);
-        scopes.top.define("z", 0);
-
-        let mut visitor = CapturesVisitor::new(Some(&scopes), Capturer::Function);
+    fn test(scopes: &Scopes, text: &str, result: &[&str]) {
+        let mut visitor = CapturesVisitor::new(Some(scopes), Capturer::Function);
         let root = parse(text);
         visitor.visit(&root);
 
@@ -611,44 +622,94 @@ mod tests {
 
     #[test]
     fn test_captures() {
+        let mut scopes = Scopes::new(None);
+        scopes.top.define("f", 0);
+        scopes.top.define("x", 0);
+        scopes.top.define("y", 0);
+        scopes.top.define("z", 0);
+        let s = &scopes;
+
         // Let binding and function definition.
-        test("#let x = x", &["x"]);
-        test("#let x; #(x + y)", &["y"]);
-        test("#let f(x, y) = x + y", &[]);
-        test("#let f(x, y) = f", &[]);
-        test("#let f = (x, y) => f", &["f"]);
+        test(s, "#let x = x", &["x"]);
+        test(s, "#let x; #(x + y)", &["y"]);
+        test(s, "#let f(x, y) = x + y", &[]);
+        test(s, "#let f(x, y) = f", &[]);
+        test(s, "#let f = (x, y) => f", &["f"]);
 
         // Closure with different kinds of params.
-        test("#((x, y) => x + z)", &["z"]);
-        test("#((x: y, z) => x + z)", &["y"]);
-        test("#((..x) => x + y)", &["y"]);
-        test("#((x, y: x + z) => x + y)", &["x", "z"]);
-        test("#{x => x; x}", &["x"]);
+        test(s, "#((x, y) => x + z)", &["z"]);
+        test(s, "#((x: y, z) => x + z)", &["y"]);
+        test(s, "#((..x) => x + y)", &["y"]);
+        test(s, "#((x, y: x + z) => x + y)", &["x", "z"]);
+        test(s, "#{x => x; x}", &["x"]);
 
         // Show rule.
-        test("#show y: x => x", &["y"]);
-        test("#show y: x => x + z", &["y", "z"]);
-        test("#show x: x => x", &["x"]);
+        test(s, "#show y: x => x", &["y"]);
+        test(s, "#show y: x => x + z", &["y", "z"]);
+        test(s, "#show x: x => x", &["x"]);
 
         // For loop.
-        test("#for x in y { x + z }", &["y", "z"]);
-        test("#for (x, y) in y { x + y }", &["y"]);
-        test("#for x in y {} #x", &["x", "y"]);
+        test(s, "#for x in y { x + z }", &["y", "z"]);
+        test(s, "#for (x, y) in y { x + y }", &["y"]);
+        test(s, "#for x in y {} #x", &["x", "y"]);
 
         // Import.
-        test("#import z: x, y", &["z"]);
-        test("#import x + y: x, y, z", &["x", "y"]);
+        test(s, "#import z: x, y", &["z"]);
+        test(s, "#import x + y: x, y, z", &["x", "y"]);
 
         // Blocks.
-        test("#{ let x = 1; { let y = 2; y }; x + y }", &["y"]);
-        test("#[#let x = 1]#x", &["x"]);
+        test(s, "#{ let x = 1; { let y = 2; y }; x + y }", &["y"]);
+        test(s, "#[#let x = 1]#x", &["x"]);
 
         // Field access.
-        test("#foo(body: 1)", &[]);
-        test("#(body: 1)", &[]);
-        test("#(body = 1)", &[]);
-        test("#(body += y)", &["y"]);
-        test("#{ (body, a) = (y, 1) }", &["y"]);
-        test("#(x.at(y) = 5)", &["x", "y"])
+        test(s, "#x.y.f(z)", &["x", "z"]);
+
+        // Parenthesized expressions.
+        test(s, "#f(x: 1)", &["f"]);
+        test(s, "#(x: 1)", &[]);
+        test(s, "#(x = 1)", &["x"]);
+        test(s, "#(x += y)", &["x", "y"]);
+        test(s, "#{ (x, z) = (y, 1) }", &["x", "y", "z"]);
+        test(s, "#(x.at(y) = 5)", &["x", "y"]);
+    }
+
+    #[test]
+    fn test_captures_in_math() {
+        let mut scopes = Scopes::new(None);
+        scopes.top.define("f", 0);
+        scopes.top.define("x", 0);
+        scopes.top.define("y", 0);
+        scopes.top.define("z", 0);
+        // Multi-letter variables are required for math.
+        scopes.top.define("foo", 0);
+        scopes.top.define("bar", 0);
+        scopes.top.define("x-bar", 0);
+        scopes.top.define("x_bar", 0);
+        let s = &scopes;
+
+        // Basic math identifier differences.
+        test(s, "$ x f(z) $", &[]); // single letters not captured.
+        test(s, "$ #x #f(z) $", &["f", "x", "z"]);
+        test(s, "$ foo f(bar) $", &["bar", "foo"]);
+        test(s, "$ #foo[#$bar$] $", &["bar", "foo"]);
+        test(s, "$ #let foo = x; foo $", &["x"]);
+
+        // Math idents don't have dashes/underscores
+        test(s, "$ x-y x_y foo-x x_bar $", &["bar", "foo"]);
+        test(s, "$ #x-bar #x_bar $", &["x-bar", "x_bar"]);
+
+        // Named-params.
+        test(s, "$ foo(bar: y) $", &["foo"]);
+        test(s, "$ foo(x-y: 1, bar-z: 2) $", &["foo"]);
+
+        // Field access in math.
+        test(s, "$ foo.bar $", &["foo"]);
+        test(s, "$ foo.x $", &["foo"]);
+        test(s, "$ x.foo $", &["foo"]);
+        test(s, "$ foo . bar $", &["bar", "foo"]);
+        test(s, "$ foo.x.y.bar(z) $", &["foo"]);
+        test(s, "$ foo.x-bar $", &["bar", "foo"]);
+        test(s, "$ foo.x_bar $", &["bar", "foo"]);
+        test(s, "$ #x_bar.x-bar $", &["x_bar"]);
     }
 }

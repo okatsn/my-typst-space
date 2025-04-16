@@ -102,6 +102,14 @@ B
 #set page(numbering: "1 / 1", margin: (bottom: 20pt))
 #counter(page).update(5)
 
+--- counter-page-display ---
+// Counter display should use numbering from style chain.
+#set page(
+  numbering: "A",
+  margin: (bottom: 20pt),
+  footer: context align(center, counter(page).display())
+)
+
 --- counter-figure ---
 // Count figures.
 #figure(numbering: "A", caption: [Four 'A's], kind: image, supplement: "Figure")[_AAAA!_]
@@ -156,3 +164,13 @@ B
 #context test(c.get(), (1,))
 #c.step(level: 3)
 #context test(c.get(), (1, 0, 1))
+
+--- counter-huge ---
+// Test values greater than 32-bits
+#let c = counter("c")
+#c.update(100000000001)
+#context test(c.get(), (100000000001,))
+#c.step()
+#context test(c.get(), (100000000002,))
+#c.update(n => n + 2)
+#context test(c.get(), (100000000004,))

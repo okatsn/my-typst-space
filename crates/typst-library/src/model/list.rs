@@ -4,10 +4,11 @@ use crate::diag::{bail, SourceResult};
 use crate::engine::Engine;
 use crate::foundations::{
     cast, elem, scope, Array, Content, Context, Depth, Func, NativeElement, Packed, Show,
-    Smart, StyleChain, Styles, Value,
+    Smart, StyleChain, Styles, TargetElem, Value,
 };
+use crate::html::{tag, HtmlElem};
 use crate::layout::{BlockElem, Em, Length, VElem};
-use crate::model::ParElem;
+use crate::model::{ParElem, ParbreakElem};
 use crate::text::TextElem;
 
 /// A bullet list.
@@ -140,12 +141,31 @@ impl ListElem {
 
 impl Show for Packed<ListElem> {
     fn show(&self, engine: &mut Engine, styles: StyleChain) -> SourceResult<Content> {
+        let tight = self.tight(styles);
+
+        if TargetElem::target_in(styles).is_html() {
+            return Ok(HtmlElem::new(tag::ul)
+                .with_body(Some(Content::sequence(self.children.iter().map(|item| {
+                    // Text in wide lists shall always turn into paragraphs.
+                    let mut body = item.body.clone();
+                    if !tight {
+                        body += ParbreakElem::shared();
+                    }
+                    HtmlElem::new(tag::li)
+                        .with_body(Some(body))
+                        .pack()
+                        .spanned(item.span())
+                }))))
+                .pack()
+                .spanned(self.span()));
+        }
+
         let mut realized =
             BlockElem::multi_layouter(self.clone(), engine.routines.layout_list)
                 .pack()
                 .spanned(self.span());
 
-        if self.tight(styles) {
+        if tight {
             let leading = ParElem::leading_in(styles);
             let spacing =
                 VElem::new(leading.into()).with_weak(true).with_attach(true).pack();

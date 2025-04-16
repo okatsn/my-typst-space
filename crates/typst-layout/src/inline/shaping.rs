@@ -11,8 +11,8 @@ use typst_library::engine::Engine;
 use typst_library::foundations::{Smart, StyleChain};
 use typst_library::layout::{Abs, Dir, Em, Frame, FrameItem, Point, Size};
 use typst_library::text::{
-    families, features, is_default_ignorable, variant, Font, FontVariant, Glyph, Lang,
-    Region, TextEdgeBounds, TextElem, TextItem,
+    families, features, is_default_ignorable, variant, Font, FontFamily, FontVariant,
+    Glyph, Lang, Region, TextEdgeBounds, TextElem, TextItem,
 };
 use typst_library::World;
 use typst_utils::SliceExt;
@@ -20,6 +20,7 @@ use unicode_bidi::{BidiInfo, Level as BidiLevel};
 use unicode_script::{Script, UnicodeScript};
 
 use super::{decorate, Item, Range, SpanMapper};
+use crate::modifiers::{FrameModifiers, FrameModify};
 
 /// The result of shaping text.
 ///
@@ -28,7 +29,7 @@ use super::{decorate, Item, Range, SpanMapper};
 /// frame.
 #[derive(Clone)]
 pub struct ShapedText<'a> {
-    /// The start of the text in the full paragraph.
+    /// The start of the text in the full text.
     pub base: usize,
     /// The text that was shaped.
     pub text: &'a str,
@@ -65,9 +66,9 @@ pub struct ShapedGlyph {
     pub y_offset: Em,
     /// The adjustability of the glyph.
     pub adjustability: Adjustability,
-    /// The byte range of this glyph's cluster in the full paragraph. A cluster
-    /// is a sequence of one or multiple glyphs that cannot be separated and
-    /// must always be treated as a union.
+    /// The byte range of this glyph's cluster in the full inline layout. A
+    /// cluster is a sequence of one or multiple glyphs that cannot be separated
+    /// and must always be treated as a union.
     ///
     /// The range values of the glyphs in a [`ShapedText`] should not overlap
     /// with each other, and they should be monotonically increasing (for
@@ -326,6 +327,7 @@ impl<'a> ShapedText<'a> {
             offset += width;
         }
 
+        frame.modify(&FrameModifiers::get_in(self.styles));
         frame
     }
 
@@ -351,7 +353,7 @@ impl<'a> ShapedText<'a> {
             for family in families(self.styles) {
                 if let Some(font) = world
                     .book()
-                    .select(family, self.variant)
+                    .select(family.as_str(), self.variant)
                     .and_then(|id| world.font(id))
                 {
                     expand(&font, TextEdgeBounds::Zero);
@@ -403,7 +405,7 @@ impl<'a> ShapedText<'a> {
     /// Reshape a range of the shaped text, reusing information from this
     /// shaping process if possible.
     ///
-    /// The text `range` is relative to the whole paragraph.
+    /// The text `range` is relative to the whole inline layout.
     pub fn reshape(&'a self, engine: &Engine, text_range: Range) -> ShapedText<'a> {
         let text = &self.text[text_range.start - self.base..text_range.end - self.base];
         if let Some(glyphs) = self.slice_safe_to_break(text_range.clone()) {
@@ -463,7 +465,8 @@ impl<'a> ShapedText<'a> {
             None
         };
         let mut chain = families(self.styles)
-            .map(|family| book.select(family, self.variant))
+            .filter(|family| family.covers().is_none_or(|c| c.is_match("-")))
+            .map(|family| book.select(family.as_str(), self.variant))
             .chain(fallback_func.iter().map(|f| f()))
             .flatten();
 
@@ -567,7 +570,7 @@ impl<'a> ShapedText<'a> {
         // for the next line.
         let dec = if ltr { usize::checked_sub } else { usize::checked_add };
         while let Some(next) = dec(idx, 1) {
-            if self.glyphs.get(next).map_or(true, |g| g.range.start != text_index) {
+            if self.glyphs.get(next).is_none_or(|g| g.range.start != text_index) {
                 break;
             }
             idx = next;
@@ -719,7 +722,7 @@ fn shape_segment<'a>(
     ctx: &mut ShapingContext,
     base: usize,
     text: &str,
-    mut families: impl Iterator<Item = &'a str> + Clone,
+    mut families: impl Iterator<Item = &'a FontFamily> + Clone,
 ) {
     // Don't try shaping newlines, tabs, or default ignorables.
     if text
@@ -732,11 +735,18 @@ fn shape_segment<'a>(
     // Find the next available family.
     let world = ctx.engine.world;
     let book = world.book();
-    let mut selection = families.find_map(|family| {
-        book.select(family, ctx.variant)
+    let mut selection = None;
+    let mut covers = None;
+    for family in families.by_ref() {
+        selection = book
+            .select(family.as_str(), ctx.variant)
             .and_then(|id| world.font(id))
-            .filter(|font| !ctx.used.contains(font))
-    });
+            .filter(|font| !ctx.used.contains(font));
+        if selection.is_some() {
+            covers = family.covers();
+            break;
+        }
+    }
 
     // Do font fallback if the families are exhausted and fallback is enabled.
     if selection.is_none() && ctx.fallback {
@@ -774,7 +784,7 @@ fn shape_segment<'a>(
     buffer.guess_segment_properties();
 
     // By default, Harfbuzz will create zero-width space glyphs for default
-    // ignorables. This is probably useful for GUI apps that want noticable
+    // ignorables. This is probably useful for GUI apps that want noticeable
     // effects on the cursor for those, but for us it's not useful and hurts
     // text extraction.
     buffer.set_flags(BufferFlags::REMOVE_DEFAULT_IGNORABLES);
@@ -795,6 +805,16 @@ fn shape_segment<'a>(
     let pos = buffer.glyph_positions();
     let ltr = ctx.dir.is_positive();
 
+    // Whether the character at the given offset is covered by the coverage.
+    let is_covered = |offset| {
+        let end = text[offset..]
+            .char_indices()
+            .nth(1)
+            .map(|(i, _)| offset + i)
+            .unwrap_or(text.len());
+        covers.is_none_or(|cov| cov.is_match(&text[offset..end]))
+    };
+
     // Collect the shaped glyphs, doing fallback and shaping parts again with
     // the next font if necessary.
     let mut i = 0;
@@ -803,13 +823,43 @@ fn shape_segment<'a>(
         let cluster = info.cluster as usize;
 
         // Add the glyph to the shaped output.
-        if info.glyph_id != 0 {
-            // Determine the text range of the glyph.
+        if info.glyph_id != 0 && is_covered(cluster) {
+            // Assume we have the following sequence of (glyph_id, cluster):
+            // [(120, 0), (80, 0), (3, 3), (755, 4), (69, 4), (424, 13),
+            //  (63, 13), (193, 25), (80, 25), (3, 31)
+            //
+            // We then want the sequence of (glyph_id, text_range) to look as follows:
+            // [(120, 0..3), (80, 0..3), (3, 3..4), (755, 4..13), (69, 4..13),
+            //  (424, 13..25), (63, 13..25), (193, 25..31), (80, 25..31), (3, 31..x)]
+            //
+            // Each glyph in the same cluster should be assigned the full text
+            // range. This is necessary because only this way krilla can
+            // properly assign `ActualText` attributes in complex shaping
+            // scenarios.
+
+            // The start of the glyph's text range.
             let start = base + cluster;
-            let end = base
-                + if ltr { i.checked_add(1) } else { i.checked_sub(1) }
-                    .and_then(|last| infos.get(last))
-                    .map_or(text.len(), |info| info.cluster as usize);
+
+            // Determine the end of the glyph's text range.
+            let mut k = i;
+            let step: isize = if ltr { 1 } else { -1 };
+            let end = loop {
+                // If we've reached the end of the glyphs, the `end` of the
+                // range should be the end of the full text.
+                let Some((next, next_info)) = k
+                    .checked_add_signed(step)
+                    .and_then(|n| infos.get(n).map(|info| (n, info)))
+                else {
+                    break base + text.len();
+                };
+
+                // If the cluster doesn't match anymore, we've reached the end.
+                if next_info.cluster != info.cluster {
+                    break base + next_info.cluster as usize;
+                }
+
+                k = next;
+            };
 
             let c = text[cluster..].chars().next().unwrap();
             let script = c.script();
@@ -836,7 +886,9 @@ fn shape_segment<'a>(
         } else {
             // First, search for the end of the tofu sequence.
             let k = i;
-            while infos.get(i + 1).is_some_and(|info| info.glyph_id == 0) {
+            while infos.get(i + 1).is_some_and(|info| {
+                info.glyph_id == 0 || !is_covered(info.cluster as usize)
+            }) {
                 i += 1;
             }
 

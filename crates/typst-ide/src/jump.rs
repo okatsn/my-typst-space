@@ -1,16 +1,18 @@
 use std::num::NonZeroUsize;
 
-use typst::layout::{Frame, FrameItem, Point, Position, Size};
-use typst::model::{Destination, Document, Url};
+use typst::layout::{Frame, FrameItem, PagedDocument, Point, Position, Size};
+use typst::model::{Destination, Url};
 use typst::syntax::{FileId, LinkedNode, Side, Source, Span, SyntaxKind};
-use typst::visualize::Geometry;
-use typst::World;
+use typst::visualize::{Curve, CurveItem, FillRule, Geometry};
+use typst::WorldExt;
+
+use crate::IdeWorld;
 
 /// Where to [jump](jump_from_click) to.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum Jump {
-    /// Jump to a position in a source file.
-    Source(FileId, usize),
+    /// Jump to a position in a file.
+    File(FileId, usize),
     /// Jump to an external URL.
     Url(Url),
     /// Jump to a point on a page.
@@ -18,18 +20,17 @@ pub enum Jump {
 }
 
 impl Jump {
-    fn from_span(world: &dyn World, span: Span) -> Option<Self> {
+    fn from_span(world: &dyn IdeWorld, span: Span) -> Option<Self> {
         let id = span.id()?;
-        let source = world.source(id).ok()?;
-        let node = source.find(span)?;
-        Some(Self::Source(id, node.offset()))
+        let offset = world.range(span)?.start;
+        Some(Self::File(id, offset))
     }
 }
 
 /// Determine where to jump to based on a click in a frame.
 pub fn jump_from_click(
-    world: &dyn World,
-    document: &Document,
+    world: &dyn IdeWorld,
+    document: &PagedDocument,
     frame: &Frame,
     click: Point,
 ) -> Option<Jump> {
@@ -52,10 +53,20 @@ pub fn jump_from_click(
     for (mut pos, item) in frame.items().rev() {
         match item {
             FrameItem::Group(group) => {
-                // TODO: Handle transformation.
-                if let Some(span) =
-                    jump_from_click(world, document, &group.frame, click - pos)
-                {
+                let pos = click - pos;
+                if let Some(clip) = &group.clip {
+                    if !clip.contains(FillRule::NonZero, pos) {
+                        continue;
+                    }
+                }
+                // Realistic transforms should always be invertible.
+                // An example of one that isn't is a scale of 0, which would
+                // not be clickable anyway.
+                let Some(inv_transform) = group.transform.invert() else {
+                    continue;
+                };
+                let pos = pos.transform_inf(inv_transform);
+                if let Some(span) = jump_from_click(world, document, &group.frame, pos) {
                     return Some(span);
                 }
             }
@@ -72,7 +83,10 @@ pub fn jump_from_click(
                         let Some(id) = span.id() else { continue };
                         let source = world.source(id).ok()?;
                         let node = source.find(span)?;
-                        let pos = if node.kind() == SyntaxKind::Text {
+                        let pos = if matches!(
+                            node.kind(),
+                            SyntaxKind::Text | SyntaxKind::MathText
+                        ) {
                             let range = node.range();
                             let mut offset = range.start + usize::from(span_offset);
                             if (click.x - pos.x) > width / 2.0 {
@@ -82,7 +96,7 @@ pub fn jump_from_click(
                         } else {
                             node.offset()
                         };
-                        return Some(Jump::Source(source.id(), pos));
+                        return Some(Jump::File(source.id(), pos));
                     }
 
                     pos.x += width;
@@ -90,9 +104,32 @@ pub fn jump_from_click(
             }
 
             FrameItem::Shape(shape, span) => {
-                let Geometry::Rect(size) = shape.geometry else { continue };
-                if is_in_rect(pos, size, click) {
-                    return Jump::from_span(world, *span);
+                if shape.fill.is_some() {
+                    let within = match &shape.geometry {
+                        Geometry::Line(..) => false,
+                        Geometry::Rect(size) => is_in_rect(pos, *size, click),
+                        Geometry::Curve(curve) => {
+                            curve.contains(shape.fill_rule, click - pos)
+                        }
+                    };
+                    if within {
+                        return Jump::from_span(world, *span);
+                    }
+                }
+
+                if let Some(stroke) = &shape.stroke {
+                    let within = !stroke.thickness.approx_empty() && {
+                        // This curve is rooted at (0, 0), not `pos`.
+                        let base_curve = match &shape.geometry {
+                            Geometry::Line(to) => &Curve(vec![CurveItem::Line(*to)]),
+                            Geometry::Rect(size) => &Curve::rect(*size),
+                            Geometry::Curve(curve) => curve,
+                        };
+                        base_curve.stroke_contains(stroke, click - pos)
+                    };
+                    if within {
+                        return Jump::from_span(world, *span);
+                    }
                 }
             }
 
@@ -109,12 +146,12 @@ pub fn jump_from_click(
 
 /// Find the output location in the document for a cursor position.
 pub fn jump_from_cursor(
-    document: &Document,
+    document: &PagedDocument,
     source: &Source,
     cursor: usize,
 ) -> Vec<Position> {
     fn is_text(node: &LinkedNode) -> bool {
-        node.get().kind() == SyntaxKind::Text
+        matches!(node.kind(), SyntaxKind::Text | SyntaxKind::MathText)
     }
 
     let root = LinkedNode::new(source.root());
@@ -142,9 +179,8 @@ pub fn jump_from_cursor(
 fn find_in_frame(frame: &Frame, span: Span) -> Option<Point> {
     for (mut pos, item) in frame.items() {
         if let FrameItem::Group(group) = item {
-            // TODO: Handle transformation.
             if let Some(point) = find_in_frame(&group.frame, span) {
-                return Some(point + pos);
+                return Some(pos + point.transform(group.transform));
             }
         }
 
@@ -181,19 +217,20 @@ mod tests {
     //! ))
     //! ```
 
+    use std::borrow::Borrow;
     use std::num::NonZeroUsize;
 
     use typst::layout::{Abs, Point, Position};
 
     use super::{jump_from_click, jump_from_cursor, Jump};
-    use crate::tests::TestWorld;
+    use crate::tests::{FilePos, TestWorld, WorldLike};
 
     fn point(x: f64, y: f64) -> Point {
         Point::new(Abs::pt(x), Abs::pt(y))
     }
 
     fn cursor(cursor: usize) -> Option<Jump> {
-        Some(Jump::Source(TestWorld::main_id(), cursor))
+        Some(Jump::File(TestWorld::main_id(), cursor))
     }
 
     fn pos(page: usize, x: f64, y: f64) -> Option<Position> {
@@ -210,10 +247,11 @@ mod tests {
     }
 
     #[track_caller]
-    fn test_click(text: &str, click: Point, expected: Option<Jump>) {
-        let world = TestWorld::new(text);
-        let doc = typst::compile(&world).output.unwrap();
-        let jump = jump_from_click(&world, &doc, &doc.pages[0].frame, click);
+    fn test_click(world: impl WorldLike, click: Point, expected: Option<Jump>) {
+        let world = world.acquire();
+        let world = world.borrow();
+        let doc = typst::compile(world).output.unwrap();
+        let jump = jump_from_click(world, &doc, &doc.pages[0].frame, click);
         if let (Some(Jump::Position(pos)), Some(Jump::Position(expected))) =
             (&jump, &expected)
         {
@@ -226,10 +264,12 @@ mod tests {
     }
 
     #[track_caller]
-    fn test_cursor(text: &str, cursor: usize, expected: Option<Position>) {
-        let world = TestWorld::new(text);
-        let doc = typst::compile(&world).output.unwrap();
-        let pos = jump_from_cursor(&doc, &world.main, cursor);
+    fn test_cursor(world: impl WorldLike, pos: impl FilePos, expected: Option<Position>) {
+        let world = world.acquire();
+        let world = world.borrow();
+        let doc = typst::compile(world).output.unwrap();
+        let (source, cursor) = pos.resolve(world);
+        let pos = jump_from_cursor(&doc, &source, cursor);
         assert_eq!(!pos.is_empty(), expected.is_some());
         if let (Some(pos), Some(expected)) = (pos.first(), expected) {
             assert_eq!(pos.page, expected.page);
@@ -257,10 +297,120 @@ mod tests {
     }
 
     #[test]
+    fn test_jump_from_click_math() {
+        test_click("$a + b$", point(28.0, 14.0), cursor(5));
+    }
+
+    #[test]
+    fn test_jump_from_click_transform_clip() {
+        let margin = point(10.0, 10.0);
+        test_click(
+            "#rect(width: 20pt, height: 20pt, fill: black)",
+            point(10.0, 10.0) + margin,
+            cursor(1),
+        );
+        test_click(
+            "#rect(width: 60pt, height: 10pt, fill: black)",
+            point(5.0, 30.0) + margin,
+            None,
+        );
+        test_click(
+            "#rotate(90deg, origin: bottom + left, rect(width: 60pt, height: 10pt, fill: black))",
+            point(5.0, 30.0) + margin,
+            cursor(38),
+        );
+        test_click(
+            "#scale(x: 300%, y: 300%, origin: top + left, rect(width: 10pt, height: 10pt, fill: black))",
+            point(20.0, 20.0) + margin,
+            cursor(45),
+        );
+        test_click(
+            "#box(width: 10pt, height: 10pt, clip: true, scale(x: 300%, y: 300%, \
+             origin: top + left, rect(width: 10pt, height: 10pt, fill: black)))",
+            point(20.0, 20.0) + margin,
+            None,
+        );
+        test_click(
+            "#box(width: 10pt, height: 10pt, clip: false, rect(width: 30pt, height: 30pt, fill: black))",
+            point(20.0, 20.0) + margin,
+            cursor(45),
+        );
+        test_click(
+            "#box(width: 10pt, height: 10pt, clip: true, rect(width: 30pt, height: 30pt, fill: black))",
+            point(20.0, 20.0) + margin,
+            None,
+        );
+        test_click(
+            "#rotate(90deg, origin: bottom + left)[hello world]",
+            point(5.0, 15.0) + margin,
+            cursor(40),
+        );
+    }
+
+    #[test]
+    fn test_jump_from_click_shapes() {
+        let margin = point(10.0, 10.0);
+
+        test_click(
+            "#rect(width: 30pt, height: 30pt, fill: black)",
+            point(15.0, 15.0) + margin,
+            cursor(1),
+        );
+
+        let circle = "#circle(width: 30pt, height: 30pt, fill: black)";
+        test_click(circle, point(15.0, 15.0) + margin, cursor(1));
+        test_click(circle, point(1.0, 1.0) + margin, None);
+
+        let bowtie =
+            "#polygon(fill: black, (0pt, 0pt), (20pt, 20pt), (20pt, 0pt), (0pt, 20pt))";
+        test_click(bowtie, point(1.0, 2.0) + margin, cursor(1));
+        test_click(bowtie, point(2.0, 1.0) + margin, None);
+        test_click(bowtie, point(19.0, 10.0) + margin, cursor(1));
+
+        let evenodd = r#"#polygon(fill: black, fill-rule: "even-odd",
+            (0pt, 10pt), (30pt, 10pt), (30pt, 20pt), (20pt, 20pt),
+            (20pt, 0pt), (10pt, 0pt), (10pt, 30pt), (20pt, 30pt),
+            (20pt, 20pt), (0pt, 20pt))"#;
+        test_click(evenodd, point(15.0, 15.0) + margin, None);
+        test_click(evenodd, point(5.0, 15.0) + margin, cursor(1));
+        test_click(evenodd, point(15.0, 5.0) + margin, cursor(1));
+    }
+
+    #[test]
+    fn test_jump_from_click_shapes_stroke() {
+        let margin = point(10.0, 10.0);
+
+        let rect =
+            "#place(dx: 10pt, dy: 10pt, rect(width: 10pt, height: 10pt, stroke: 5pt))";
+        test_click(rect, point(15.0, 15.0) + margin, None);
+        test_click(rect, point(10.0, 15.0) + margin, cursor(27));
+
+        test_click(
+            "#line(angle: 45deg, length: 10pt, stroke: 2pt)",
+            point(2.0, 2.0) + margin,
+            cursor(1),
+        );
+    }
+
+    #[test]
     fn test_jump_from_cursor() {
         let s = "*Hello* #box[ABC] World";
         test_cursor(s, 12, None);
         test_cursor(s, 14, pos(1, 37.55, 16.58));
+    }
+
+    #[test]
+    fn test_jump_from_cursor_math() {
+        test_cursor("$a + b$", -3, pos(1, 27.51, 16.83));
+    }
+
+    #[test]
+    fn test_jump_from_cursor_transform() {
+        test_cursor(
+            r#"#rotate(90deg, origin: bottom + left, [hello world])"#,
+            -5,
+            pos(1, 10.0, 16.58),
+        );
     }
 
     #[test]

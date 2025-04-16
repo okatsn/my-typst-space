@@ -11,16 +11,16 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use typst_syntax::{ast, Span};
 use typst_utils::ArcExt;
 
-use crate::diag::{HintedStrResult, HintedString, StrResult};
+use crate::diag::{DeprecationSink, HintedStrResult, HintedString, StrResult};
 use crate::foundations::{
     fields, ops, repr, Args, Array, AutoValue, Bytes, CastInfo, Content, Datetime,
     Decimal, Dict, Duration, Fold, FromValue, Func, IntoValue, Label, Module,
-    NativeElement, NativeType, NoneValue, Plugin, Reflect, Repr, Resolve, Scope, Str,
-    Styles, Symbol, Type, Version,
+    NativeElement, NativeType, NoneValue, Reflect, Repr, Resolve, Scope, Str, Styles,
+    Symbol, SymbolElem, Type, Version,
 };
 use crate::layout::{Abs, Angle, Em, Fr, Length, Ratio, Rel};
 use crate::text::{RawContent, RawElem, TextElem};
-use crate::visualize::{Color, Gradient, Pattern};
+use crate::visualize::{Color, Gradient, Tiling};
 
 /// A computational value.
 #[derive(Default, Clone)]
@@ -50,8 +50,8 @@ pub enum Value {
     Color(Color),
     /// A gradient value: `gradient.linear(...)`.
     Gradient(Gradient),
-    /// A pattern fill: `pattern(...)`.
-    Pattern(Pattern),
+    /// A tiling fill: `tiling(...)`.
+    Tiling(Tiling),
     /// A symbol: `arrow.l`.
     Symbol(Symbol),
     /// A version.
@@ -84,8 +84,6 @@ pub enum Value {
     Type(Type),
     /// A module.
     Module(Module),
-    /// A WebAssembly plugin.
-    Plugin(Plugin),
     /// A dynamic value.
     Dyn(Dynamic),
 }
@@ -130,7 +128,7 @@ impl Value {
             Self::Fraction(_) => Type::of::<Fr>(),
             Self::Color(_) => Type::of::<Color>(),
             Self::Gradient(_) => Type::of::<Gradient>(),
-            Self::Pattern(_) => Type::of::<Pattern>(),
+            Self::Tiling(_) => Type::of::<Tiling>(),
             Self::Symbol(_) => Type::of::<Symbol>(),
             Self::Version(_) => Type::of::<Version>(),
             Self::Str(_) => Type::of::<Str>(),
@@ -147,7 +145,6 @@ impl Value {
             Self::Args(_) => Type::of::<Args>(),
             Self::Type(_) => Type::of::<Type>(),
             Self::Module(_) => Type::of::<Module>(),
-            Self::Plugin(_) => Type::of::<Plugin>(),
             Self::Dyn(v) => v.ty(),
         }
     }
@@ -158,15 +155,15 @@ impl Value {
     }
 
     /// Try to access a field on the value.
-    pub fn field(&self, field: &str) -> StrResult<Value> {
+    pub fn field(&self, field: &str, sink: impl DeprecationSink) -> StrResult<Value> {
         match self {
             Self::Symbol(symbol) => symbol.clone().modified(field).map(Self::Symbol),
             Self::Version(version) => version.component(field).map(Self::Int),
             Self::Dict(dict) => dict.get(field).cloned(),
             Self::Content(content) => content.field_by_name(field),
-            Self::Type(ty) => ty.field(field).cloned(),
-            Self::Func(func) => func.field(field).cloned(),
-            Self::Module(module) => module.field(field).cloned(),
+            Self::Type(ty) => ty.field(field, sink).cloned(),
+            Self::Func(func) => func.field(field, sink).cloned(),
+            Self::Module(module) => module.field(field, sink).cloned(),
             _ => fields::field(self, field),
         }
     }
@@ -177,16 +174,6 @@ impl Value {
             Self::Func(func) => func.scope(),
             Self::Type(ty) => Some(ty.scope()),
             Self::Module(module) => Some(module.scope()),
-            _ => None,
-        }
-    }
-
-    /// The name, if this is a function, type, or module.
-    pub fn name(&self) -> Option<&str> {
-        match self {
-            Self::Func(func) => func.name(),
-            Self::Type(ty) => Some(ty.short_name()),
-            Self::Module(module) => Some(module.name()),
             _ => None,
         }
     }
@@ -209,7 +196,7 @@ impl Value {
             Self::Decimal(v) => TextElem::packed(eco_format!("{v}")),
             Self::Str(v) => TextElem::packed(v),
             Self::Version(v) => TextElem::packed(eco_format!("{v}")),
-            Self::Symbol(v) => TextElem::packed(v.get()),
+            Self::Symbol(v) => SymbolElem::packed(v.get()),
             Self::Content(v) => v,
             Self::Module(module) => module.content(),
             _ => RawElem::new(RawContent::Text(self.repr()))
@@ -244,7 +231,7 @@ impl Debug for Value {
             Self::Fraction(v) => Debug::fmt(v, f),
             Self::Color(v) => Debug::fmt(v, f),
             Self::Gradient(v) => Debug::fmt(v, f),
-            Self::Pattern(v) => Debug::fmt(v, f),
+            Self::Tiling(v) => Debug::fmt(v, f),
             Self::Symbol(v) => Debug::fmt(v, f),
             Self::Version(v) => Debug::fmt(v, f),
             Self::Str(v) => Debug::fmt(v, f),
@@ -261,7 +248,6 @@ impl Debug for Value {
             Self::Args(v) => Debug::fmt(v, f),
             Self::Type(v) => Debug::fmt(v, f),
             Self::Module(v) => Debug::fmt(v, f),
-            Self::Plugin(v) => Debug::fmt(v, f),
             Self::Dyn(v) => Debug::fmt(v, f),
         }
     }
@@ -282,7 +268,7 @@ impl Repr for Value {
             Self::Fraction(v) => v.repr(),
             Self::Color(v) => v.repr(),
             Self::Gradient(v) => v.repr(),
-            Self::Pattern(v) => v.repr(),
+            Self::Tiling(v) => v.repr(),
             Self::Symbol(v) => v.repr(),
             Self::Version(v) => v.repr(),
             Self::Str(v) => v.repr(),
@@ -299,7 +285,6 @@ impl Repr for Value {
             Self::Args(v) => v.repr(),
             Self::Type(v) => v.repr(),
             Self::Module(v) => v.repr(),
-            Self::Plugin(v) => v.repr(),
             Self::Dyn(v) => v.repr(),
         }
     }
@@ -333,7 +318,7 @@ impl Hash for Value {
             Self::Fraction(v) => v.hash(state),
             Self::Color(v) => v.hash(state),
             Self::Gradient(v) => v.hash(state),
-            Self::Pattern(v) => v.hash(state),
+            Self::Tiling(v) => v.hash(state),
             Self::Symbol(v) => v.hash(state),
             Self::Version(v) => v.hash(state),
             Self::Str(v) => v.hash(state),
@@ -350,7 +335,6 @@ impl Hash for Value {
             Self::Args(v) => v.hash(state),
             Self::Type(v) => v.hash(state),
             Self::Module(v) => v.hash(state),
-            Self::Plugin(v) => v.hash(state),
             Self::Dyn(v) => v.hash(state),
         }
     }
@@ -459,15 +443,15 @@ impl<'de> Visitor<'de> for ValueVisitor {
     }
 
     fn visit_bytes<E: Error>(self, v: &[u8]) -> Result<Self::Value, E> {
-        Ok(Bytes::from(v).into_value())
+        Ok(Bytes::new(v.to_vec()).into_value())
     }
 
     fn visit_borrowed_bytes<E: Error>(self, v: &'de [u8]) -> Result<Self::Value, E> {
-        Ok(Bytes::from(v).into_value())
+        Ok(Bytes::new(v.to_vec()).into_value())
     }
 
     fn visit_byte_buf<E: Error>(self, v: Vec<u8>) -> Result<Self::Value, E> {
-        Ok(Bytes::from(v).into_value())
+        Ok(Bytes::new(v).into_value())
     }
 
     fn visit_none<E: Error>(self) -> Result<Self::Value, E> {
@@ -640,7 +624,7 @@ primitive! { Rel<Length>:  "relative length",
 primitive! { Fr: "fraction", Fraction }
 primitive! { Color: "color", Color }
 primitive! { Gradient: "gradient", Gradient }
-primitive! { Pattern: "pattern", Pattern }
+primitive! { Tiling: "tiling", Tiling }
 primitive! { Symbol: "symbol", Symbol }
 primitive! { Version: "version", Version }
 primitive! {
@@ -656,7 +640,7 @@ primitive! { Duration: "duration", Duration }
 primitive! { Content: "content",
     Content,
     None => Content::empty(),
-    Symbol(v) => TextElem::packed(v.get()),
+    Symbol(v) => SymbolElem::packed(v.get()),
     Str(v) => TextElem::packed(v)
 }
 primitive! { Styles: "styles", Styles }
@@ -671,7 +655,6 @@ primitive! {
 primitive! { Args: "arguments", Args }
 primitive! { Type: "type", Type }
 primitive! { Module: "module", Module }
-primitive! { Plugin: "plugin", Plugin }
 
 impl<T: Reflect> Reflect for Arc<T> {
     fn input() -> CastInfo {
@@ -728,6 +711,11 @@ mod tests {
     #[track_caller]
     fn test(value: impl IntoValue, exp: &str) {
         assert_eq!(value.into_value().repr(), exp);
+    }
+
+    #[test]
+    fn test_value_size() {
+        assert!(std::mem::size_of::<Value>() <= 32);
     }
 
     #[test]

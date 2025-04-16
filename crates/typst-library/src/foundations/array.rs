@@ -172,17 +172,29 @@ impl Array {
     }
 
     /// Returns the first item in the array. May be used on the left-hand side
-    /// of an assignment. Fails with an error if the array is empty.
+    /// an assignment. Returns the default value if the array is empty
+    /// or fails with an error is no default value was specified.
     #[func]
-    pub fn first(&self) -> StrResult<Value> {
-        self.0.first().cloned().ok_or_else(array_is_empty)
+    pub fn first(
+        &self,
+        /// A default value to return if the array is empty.
+        #[named]
+        default: Option<Value>,
+    ) -> StrResult<Value> {
+        self.0.first().cloned().or(default).ok_or_else(array_is_empty)
     }
 
     /// Returns the last item in the array. May be used on the left-hand side of
-    /// an assignment. Fails with an error if the array is empty.
+    /// an assignment. Returns the default value if the array is empty
+    /// or fails with an error is no default value was specified.
     #[func]
-    pub fn last(&self) -> StrResult<Value> {
-        self.0.last().cloned().ok_or_else(array_is_empty)
+    pub fn last(
+        &self,
+        /// A default value to return if the array is empty.
+        #[named]
+        default: Option<Value>,
+    ) -> StrResult<Value> {
+        self.0.last().cloned().or(default).ok_or_else(array_is_empty)
     }
 
     /// Returns the item at the specified index in the array. May be used on the
@@ -301,9 +313,7 @@ impl Array {
     #[func]
     pub fn find(
         &self,
-        /// The engine.
         engine: &mut Engine,
-        /// The callsite context.
         context: Tracked<Context>,
         /// The function to apply to each item. Must return a boolean.
         searcher: Func,
@@ -325,9 +335,7 @@ impl Array {
     #[func]
     pub fn position(
         &self,
-        /// The engine.
         engine: &mut Engine,
-        /// The callsite context.
         context: Tracked<Context>,
         /// The function to apply to each item. Must return a boolean.
         searcher: Func,
@@ -363,8 +371,6 @@ impl Array {
     /// ```
     #[func]
     pub fn range(
-        /// The real arguments (the other arguments are just for the docs, this
-        /// function is a bit involved, so we parse the arguments manually).
         args: &mut Args,
         /// The start of the range (inclusive).
         #[external]
@@ -402,9 +408,7 @@ impl Array {
     #[func]
     pub fn filter(
         &self,
-        /// The engine.
         engine: &mut Engine,
-        /// The callsite context.
         context: Tracked<Context>,
         /// The function to apply to each item. Must return a boolean.
         test: Func,
@@ -427,9 +431,7 @@ impl Array {
     #[func]
     pub fn map(
         self,
-        /// The engine.
         engine: &mut Engine,
-        /// The callsite context.
         context: Tracked<Context>,
         /// The function to apply to each item.
         mapper: Func,
@@ -481,8 +483,6 @@ impl Array {
     #[func]
     pub fn zip(
         self,
-        /// The real arguments (the `others` arguments are just for the docs, this
-        /// function is a bit involved, so we parse the positional arguments manually).
         args: &mut Args,
         /// Whether all arrays have to have the same length.
         /// For example, `{(1, 2).zip((1, 2, 3), exact: true)}` produces an
@@ -569,9 +569,7 @@ impl Array {
     #[func]
     pub fn fold(
         self,
-        /// The engine.
         engine: &mut Engine,
-        /// The callsite context.
         context: Tracked<Context>,
         /// The initial value to start with.
         init: Value,
@@ -631,9 +629,7 @@ impl Array {
     #[func]
     pub fn any(
         self,
-        /// The engine.
         engine: &mut Engine,
-        /// The callsite context.
         context: Tracked<Context>,
         /// The function to apply to each item. Must return a boolean.
         test: Func,
@@ -651,9 +647,7 @@ impl Array {
     #[func]
     pub fn all(
         self,
-        /// The engine.
         engine: &mut Engine,
-        /// The callsite context.
         context: Tracked<Context>,
         /// The function to apply to each item. Must return a boolean.
         test: Func,
@@ -769,7 +763,7 @@ impl Array {
     ///
     /// ```example
     /// #let array = (1, 2, 3, 4, 5, 6, 7, 8)
-    /// #array.chunks(3)
+    /// #array.chunks(3) \
     /// #array.chunks(3, exact: true)
     /// ```
     #[func]
@@ -814,47 +808,158 @@ impl Array {
     /// function. The sorting algorithm used is stable.
     ///
     /// Returns an error if two values could not be compared or if the key
-    /// function (if given) yields an error.
+    /// or comparison function (if given) yields an error.
+    ///
+    /// To sort according to multiple criteria at once, e.g. in case of equality
+    /// between some criteria, the key function can return an array. The results
+    /// are in lexicographic order.
+    ///
+    /// ```example
+    /// #let array = (
+    ///   (a: 2, b: 4),
+    ///   (a: 1, b: 5),
+    ///   (a: 2, b: 3),
+    /// )
+    /// #array.sorted(key: it => (it.a, it.b))
+    /// ```
     #[func]
     pub fn sorted(
         self,
-        /// The engine.
         engine: &mut Engine,
-        /// The callsite context.
         context: Tracked<Context>,
-        /// The callsite span.
         span: Span,
         /// If given, applies this function to the elements in the array to
         /// determine the keys to sort by.
         #[named]
         key: Option<Func>,
+        /// If given, uses this function to compare elements in the array.
+        ///
+        /// This function should return a boolean: `{true}` indicates that the
+        /// elements are in order, while `{false}` indicates that they should be
+        /// swapped. To keep the sort stable, if the two elements are equal, the
+        /// function should return `{true}`.
+        ///
+        /// If this function does not order the elements properly (e.g., by
+        /// returning `{false}` for both `{(x, y)}` and `{(y, x)}`, or for
+        /// `{(x, x)}`), the resulting array will be in unspecified order.
+        ///
+        /// When used together with `key`, `by` will be passed the keys instead
+        /// of the elements.
+        ///
+        /// ```example
+        /// #(
+        ///   "sorted",
+        ///   "by",
+        ///   "decreasing",
+        ///   "length",
+        /// ).sorted(
+        ///   key: s => s.len(),
+        ///   by: (l, r) => l >= r,
+        /// )
+        /// ```
+        #[named]
+        by: Option<Func>,
     ) -> SourceResult<Array> {
-        let mut result = Ok(());
-        let mut vec = self.0;
-        let mut key_of = |x: Value| match &key {
-            // NOTE: We are relying on `comemo`'s memoization of function
-            // evaluation to not excessively reevaluate the `key`.
-            Some(f) => f.call(engine, context, [x]),
-            None => Ok(x),
-        };
-        vec.make_mut().sort_by(|a, b| {
-            // Until we get `try` blocks :)
-            match (key_of(a.clone()), key_of(b.clone())) {
-                (Ok(a), Ok(b)) => ops::compare(&a, &b).unwrap_or_else(|err| {
-                    if result.is_ok() {
-                        result = Err(err).at(span);
+        match by {
+            Some(by) => {
+                let mut are_in_order = |mut x, mut y| {
+                    if let Some(f) = &key {
+                        // We rely on `comemo`'s memoization of function
+                        // evaluation to not excessively reevaluate the key.
+                        x = f.call(engine, context, [x])?;
+                        y = f.call(engine, context, [y])?;
                     }
-                    Ordering::Equal
-                }),
-                (Err(e), _) | (_, Err(e)) => {
-                    if result.is_ok() {
-                        result = Err(e);
+                    match by.call(engine, context, [x, y])? {
+                        Value::Bool(b) => Ok(b),
+                        x => {
+                            bail!(
+                                span,
+                                "expected boolean from `by` function, got {}",
+                                x.ty(),
+                            )
+                        }
                     }
-                    Ordering::Equal
-                }
+                };
+                // If a comparison function is provided, we use `glidesort`
+                // instead of the standard library sorting algorithm to prevent
+                // panics in case the comparison function does not define a
+                // valid order (see https://github.com/typst/typst/pull/5627).
+                let mut result = Ok(());
+                let mut vec = self.0.into_iter().enumerate().collect::<Vec<_>>();
+                glidesort::sort_by(&mut vec, |(i, x), (j, y)| {
+                    // Because we use booleans for the comparison function, in
+                    // order to keep the sort stable, we need to compare in the
+                    // right order.
+                    if i < j {
+                        // If `x` and `y` appear in this order in the original
+                        // array, then we should change their order (i.e.,
+                        // return `Ordering::Greater`) iff `y` is strictly less
+                        // than `x` (i.e., `compare(x, y)` returns `false`).
+                        // Otherwise, we should keep them in the same order
+                        // (i.e., return `Ordering::Less`).
+                        match are_in_order(x.clone(), y.clone()) {
+                            Ok(false) => Ordering::Greater,
+                            Ok(true) => Ordering::Less,
+                            Err(err) => {
+                                if result.is_ok() {
+                                    result = Err(err);
+                                }
+                                Ordering::Equal
+                            }
+                        }
+                    } else {
+                        // If `x` and `y` appear in the opposite order in the
+                        // original array, then we should change their order
+                        // (i.e., return `Ordering::Less`) iff `x` is strictly
+                        // less than `y` (i.e., `compare(y, x)` returns
+                        // `false`). Otherwise, we should keep them in the same
+                        // order (i.e., return `Ordering::Less`).
+                        match are_in_order(y.clone(), x.clone()) {
+                            Ok(false) => Ordering::Less,
+                            Ok(true) => Ordering::Greater,
+                            Err(err) => {
+                                if result.is_ok() {
+                                    result = Err(err);
+                                }
+                                Ordering::Equal
+                            }
+                        }
+                    }
+                });
+                result.map(|()| vec.into_iter().map(|(_, x)| x).collect())
             }
-        });
-        result.map(|_| vec.into())
+
+            None => {
+                let mut key_of = |x: Value| match &key {
+                    // We rely on `comemo`'s memoization of function evaluation
+                    // to not excessively reevaluate the key.
+                    Some(f) => f.call(engine, context, [x]),
+                    None => Ok(x),
+                };
+                // If no comparison function is provided, we know the order is
+                // valid, so we can use the standard library sort and prevent an
+                // extra allocation.
+                let mut result = Ok(());
+                let mut vec = self.0;
+                vec.make_mut().sort_by(|a, b| {
+                    match (key_of(a.clone()), key_of(b.clone())) {
+                        (Ok(a), Ok(b)) => ops::compare(&a, &b).unwrap_or_else(|err| {
+                            if result.is_ok() {
+                                result = Err(err).at(span);
+                            }
+                            Ordering::Equal
+                        }),
+                        (Err(e), _) | (_, Err(e)) => {
+                            if result.is_ok() {
+                                result = Err(e);
+                            }
+                            Ordering::Equal
+                        }
+                    }
+                });
+                result.map(|()| vec.into())
+            }
+        }
     }
 
     /// Deduplicates all items in the array.
@@ -868,9 +973,7 @@ impl Array {
     #[func(title = "Deduplicate")]
     pub fn dedup(
         self,
-        /// The engine.
         engine: &mut Engine,
-        /// The callsite context.
         context: Tracked<Context>,
         /// If given, applies this function to the elements in the array to
         /// determine the keys to deduplicate by.
@@ -954,9 +1057,7 @@ impl Array {
     #[func]
     pub fn reduce(
         self,
-        /// The engine.
         engine: &mut Engine,
-        /// The callsite context.
         context: Tracked<Context>,
         /// The reducing function. Must have two parameters: One for the
         /// accumulated value and one for an item.
@@ -1108,6 +1209,53 @@ impl<T: FromValue> FromValue for Vec<T> {
 impl<T: FromValue, const N: usize> FromValue for SmallVec<[T; N]> {
     fn from_value(value: Value) -> HintedStrResult<Self> {
         value.cast::<Array>()?.into_iter().map(Value::cast).collect()
+    }
+}
+
+/// One element, or multiple provided as an array.
+#[derive(Debug, Clone, PartialEq, Hash)]
+pub struct OneOrMultiple<T>(pub Vec<T>);
+
+impl<T: Reflect> Reflect for OneOrMultiple<T> {
+    fn input() -> CastInfo {
+        T::input() + Array::input()
+    }
+
+    fn output() -> CastInfo {
+        T::output() + Array::output()
+    }
+
+    fn castable(value: &Value) -> bool {
+        Array::castable(value) || T::castable(value)
+    }
+}
+
+impl<T: IntoValue + Clone> IntoValue for OneOrMultiple<T> {
+    fn into_value(self) -> Value {
+        self.0.into_value()
+    }
+}
+
+impl<T: FromValue> FromValue for OneOrMultiple<T> {
+    fn from_value(value: Value) -> HintedStrResult<Self> {
+        if T::castable(&value) {
+            return Ok(Self(vec![T::from_value(value)?]));
+        }
+        if Array::castable(&value) {
+            return Ok(Self(
+                Array::from_value(value)?
+                    .into_iter()
+                    .map(|value| T::from_value(value))
+                    .collect::<HintedStrResult<_>>()?,
+            ));
+        }
+        Err(Self::error(&value))
+    }
+}
+
+impl<T> Default for OneOrMultiple<T> {
+    fn default() -> Self {
+        Self(vec![])
     }
 }
 

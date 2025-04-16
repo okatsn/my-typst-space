@@ -12,11 +12,13 @@ use crate::foundations::{
     cast, elem, Args, AutoValue, Cast, Construct, Content, Context, Dict, Fold, Func,
     NativeElement, Set, Smart, StyleChain, Value,
 };
+use crate::introspection::Introspector;
 use crate::layout::{
     Abs, Alignment, FlushElem, Frame, HAlignment, Length, OuterVAlignment, Ratio, Rel,
     Sides, SpecificAlignment,
 };
-use crate::model::Numbering;
+use crate::model::{DocumentInfo, Numbering};
+use crate::text::LocalName;
 use crate::visualize::{Color, Paint};
 
 /// Layouts its child onto one or multiple pages.
@@ -73,9 +75,10 @@ pub struct PageElem {
     /// The height of the page.
     ///
     /// If this is set to `{auto}`, page breaks can only be triggered manually
-    /// by inserting a [page break]($pagebreak). Most examples throughout this
-    /// documentation use `{auto}` for the height of the page to dynamically
-    /// grow and shrink to fit their content.
+    /// by inserting a [page break]($pagebreak) or by adding another non-empty
+    /// page set rule. Most examples throughout this documentation use `{auto}`
+    /// for the height of the page to dynamically grow and shrink to fit their
+    /// content.
     #[resolve]
     #[parse(
         args.named("height")?
@@ -222,6 +225,19 @@ pub struct PageElem {
     #[ghost]
     pub numbering: Option<Numbering>,
 
+    /// A supplement for the pages.
+    ///
+    /// For page references, this is added before the page number.
+    ///
+    /// ```example
+    /// #set page(numbering: "1.", supplement: [p.])
+    ///
+    /// = Introduction <intro>
+    /// We are on #ref(<intro>, form: "page")!
+    /// ```
+    #[ghost]
+    pub supplement: Smart<Option<Content>>,
+
     /// The alignment of the page numbering.
     ///
     /// If the vertical component is `top`, the numbering is placed into the
@@ -255,7 +271,7 @@ pub struct PageElem {
     ///   margin: (top: 32pt, bottom: 20pt),
     ///   header: [
     ///     #set text(8pt)
-    ///     #smallcaps[Typst Academcy]
+    ///     #smallcaps[Typst Academy]
     ///     #h(1fr) _Exercise Sheet 3_
     ///   ],
     /// )
@@ -376,6 +392,10 @@ impl Construct for PageElem {
     }
 }
 
+impl LocalName for PageElem {
+    const KEY: &'static str = "page";
+}
+
 /// A manual page break.
 ///
 /// Must not be used inside any containers.
@@ -433,6 +453,17 @@ impl PagebreakElem {
     }
 }
 
+/// A finished document with metadata and page frames.
+#[derive(Debug, Default, Clone)]
+pub struct PagedDocument {
+    /// The document's finished pages.
+    pub pages: Vec<Page>,
+    /// Details about the document.
+    pub info: DocumentInfo,
+    /// Provides the ability to execute queries on the document.
+    pub introspector: Introspector,
+}
+
 /// A finished page.
 #[derive(Debug, Clone)]
 pub struct Page {
@@ -449,9 +480,11 @@ pub struct Page {
     pub fill: Smart<Option<Paint>>,
     /// The page's numbering.
     pub numbering: Option<Numbering>,
+    /// The page's supplement.
+    pub supplement: Content,
     /// The logical page number (controlled by `counter(page)` and may thus not
     /// match the physical number).
-    pub number: usize,
+    pub number: u64,
 }
 
 impl Page {
@@ -921,4 +954,15 @@ papers! {
     (NEWSPAPER_BROADSHEET: 381.0,    578.0, "newspaper-broadsheet")
     (PRESENTATION_16_9:    297.0, 167.0625, "presentation-16-9")
     (PRESENTATION_4_3:     280.0,    210.0, "presentation-4-3")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_paged_document_is_send_and_sync() {
+        fn ensure_send_and_sync<T: Send + Sync>() {}
+        ensure_send_and_sync::<PagedDocument>();
+    }
 }
