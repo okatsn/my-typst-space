@@ -23,12 +23,12 @@ fi
 
 # Build the image if BUILD_IMAGE is true
 if [ "$BUILD_IMAGE" = true ]; then
-  echo "Building Docker image with tag: $IMAGE_NAME:latest"
+  echo "Building Docker image with tag: $IMAGE_NAME:temp"
   # Build with the first tag provided
-  docker build -t "$IMAGE_NAME:latest" .
+  docker build -t "$IMAGE_NAME:temp" .
 else
   echo "Skipping build step (--no-build specified)."
-  echo "Assuming image $IMAGE_NAME:latest already exists locally."
+  echo "Assuming image $IMAGE_NAME:temp already exists locally..."
 fi
 
 
@@ -37,7 +37,7 @@ for TAG in "${TAGS[@]}"; do
   # Tag additional tags if necessary (skip if it's the first tag and we built it)
   echo "Tagging image as: $IMAGE_NAME:$TAG"
   # Tag from the first tag specified
-  docker tag "$IMAGE_NAME:latest" "$IMAGE_NAME:$TAG"
+  docker tag "$IMAGE_NAME:temp" "$IMAGE_NAME:$TAG"
 
   echo "Pushing Docker image: $IMAGE_NAME:$TAG"
   docker push "$IMAGE_NAME:$TAG"
