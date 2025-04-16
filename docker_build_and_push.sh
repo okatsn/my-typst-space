@@ -1,7 +1,8 @@
 echo "Dockerfile modified. Building and pushing Docker image..."
 
-docker build -t okatsn/my-typst-space:latest .
+docker build imgtyp .
 
+docker tag imgtyp okatsn/my-typst-space:latest
 
 docker push okatsn/my-typst-space:latest
 
