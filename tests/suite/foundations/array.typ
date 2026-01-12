@@ -223,6 +223,8 @@
 #test(range(10).slice(2, 6), (2, 3, 4, 5))
 #test(range(10).slice(4, count: 3), (4, 5, 6))
 #test(range(10).slice(-5, count: 2), (5, 6))
+#test((1, 2, 3).slice(-3, count: 3), (1, 2, 3))
+#test((1, 2, 3).slice(-1, count: 1), (3,))
 #test((1, 2, 3).slice(2, -2), ())
 #test((1, 2, 3).slice(-2, 2), (2,))
 #test((1, 2, 3).slice(-3, 2), (1, 2))
@@ -231,6 +233,10 @@
 --- array-slice-out-of-bounds ---
 // Error: 2-30 array index out of bounds (index: 12, len: 10)
 #range(10).slice(9, count: 3)
+
+--- array-slice-out-of-bounds-from-back ---
+// Error: 2-31 array index out of bounds (index: 12, len: 10)
+#range(10).slice(-2, count: 4)
 
 --- array-slice-out-of-bounds-negative ---
 // Error: 2-24 array index out of bounds (index: -4, len: 3)
@@ -293,6 +299,11 @@
 #test((1,).join(), 1)
 #test(("a", "b", "c").join(), "abc")
 #test("(" + ("a", "b", "c").join(", ") + ")", "(a, b, c)")
+
+--- array-join-default ---
+#test(().join(default: "EMPTY", ", "), "EMPTY")
+#test(("hello",).join(default: "EMPTY", ", "), "hello")
+#test(("hello", "world").join(default: "EMPTY", ", "), "hello, world")
 
 --- array-join-bad-values ---
 // Error: 2-22 cannot join boolean with boolean
@@ -428,12 +439,19 @@
 // Error: 32-37 cannot divide by zero
 #(1, 2, 0, 3).sorted(key: x => 5 / x)
 
+--- array-sorted-underdetermined-with-key ---
+// Error: 2-40 cannot compare content and content
+// Hint: 2-40 consider defining the comparison with `by` or choosing a different `key`
+#((1, []), (1, [])).sorted(key: a => a)
+
 --- array-sorted-uncomparable ---
 // Error: 2-26 cannot compare content and content
+// Hint: 2-26 consider choosing a `key` or defining the comparison with `by`
 #([Hi], [There]).sorted()
 
 --- array-sorted-uncomparable-lengths ---
 // Error: 2-26 cannot compare 3em with 2pt
+// Hint: 2-26 consider choosing a `key` or defining the comparison with `by`
 #(1pt, 2pt, 3em).sorted()
 
 --- array-sorted-key-function-positional-2 ---
@@ -519,3 +537,8 @@
 --- array-reduce-unexpected-argument ---
 // Error: 19-21 unexpected argument
 #(1, 2, 3).reduce(() => none)
+
+--- issue-6285-crashed-with-sorting-non-total-order ---
+// Error: 2-66 cannot compare none and string
+// Hint: 2-66 consider choosing a `key` or defining the comparison with `by`
+#(("a", "b", "c", "d", "e", "z") * 3 + ("c", none, "a")).sorted()

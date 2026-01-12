@@ -10,11 +10,11 @@ use typst_syntax::{Span, Spanned};
 use unicode_normalization::UnicodeNormalization;
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::diag::{bail, At, SourceResult, StrResult};
+use crate::diag::{At, SourceResult, StrResult, bail};
 use crate::engine::Engine;
 use crate::foundations::{
-    cast, dict, func, repr, scope, ty, Array, Bytes, Cast, Context, Decimal, Dict, Func,
-    IntoValue, Label, Repr, Type, Value, Version,
+    Array, Bytes, Cast, Context, Decimal, Dict, Func, IntoValue, Label, Repr, Type,
+    Value, Version, cast, dict, func, repr, scope, ty,
 };
 use crate::layout::Alignment;
 
@@ -42,9 +42,10 @@ pub use crate::__format_str as format_str;
 /// [joined together]($scripting/#blocks) and multiplied with integers.
 ///
 /// Typst provides utility methods for string manipulation. Many of these
-/// methods (e.g., `split`, `trim` and `replace`) operate on _patterns:_ A
-/// pattern can be either a string or a [regular expression]($regex). This makes
-/// the methods quite versatile.
+/// methods (e.g., [`split`]($str.split), [`trim`]($str.trim) and
+/// [`replace`]($str.replace)) operate on _patterns:_ A pattern can be either a
+/// string or a [regular expression]($regex). This makes the methods quite
+/// versatile.
 ///
 /// All lengths and indices are expressed in terms of UTF-8 bytes. Indices are
 /// zero-based and negative indices wrap around to the end of the string.
@@ -57,8 +58,8 @@ pub use crate::__format_str as format_str;
 /// #"\"hello\n  world\"!" \
 /// #"1 2 3".split() \
 /// #"1,2;3".split(regex("[,;]")) \
-/// #(regex("\d+") in "ten euros") \
-/// #(regex("\d+") in "10 euros")
+/// #(regex("\\d+") in "ten euros") \
+/// #(regex("\\d+") in "10 euros")
 /// ```
 ///
 /// # Escape sequences { #escapes }
@@ -179,24 +180,40 @@ impl Str {
     }
 
     /// Extracts the first grapheme cluster of the string.
-    /// Fails with an error if the string is empty.
+    ///
+    /// Returns the provided default value if the string is empty or fails with
+    /// an error if no default value was specified.
     #[func]
-    pub fn first(&self) -> StrResult<Str> {
+    pub fn first(
+        &self,
+        /// A default value to return if the string is empty.
+        #[named]
+        default: Option<Str>,
+    ) -> StrResult<Str> {
         self.0
             .graphemes(true)
             .next()
             .map(Into::into)
+            .or(default)
             .ok_or_else(string_is_empty)
     }
 
     /// Extracts the last grapheme cluster of the string.
-    /// Fails with an error if the string is empty.
+    ///
+    /// Returns the provided default value if the string is empty or fails with
+    /// an error if no default value was specified.
     #[func]
-    pub fn last(&self) -> StrResult<Str> {
+    pub fn last(
+        &self,
+        /// A default value to return if the string is empty.
+        #[named]
+        default: Option<Str>,
+    ) -> StrResult<Str> {
         self.0
             .graphemes(true)
             .next_back()
             .map(Into::into)
+            .or(default)
             .ok_or_else(string_is_empty)
     }
 
@@ -237,9 +254,9 @@ impl Str {
         #[named]
         count: Option<i64>,
     ) -> StrResult<Str> {
-        let end = end.or(count.map(|c| start + c)).unwrap_or(self.len() as i64);
         let start = self.locate(start)?;
-        let end = self.locate(end)?.max(start);
+        let end = end.or(count.map(|c| start as i64 + c));
+        let end = self.locate(end.unwrap_or(self.len() as i64))?.max(start);
         Ok(self.0[start..end].into())
     }
 
@@ -406,6 +423,17 @@ impl Str {
     ///   group. The first item of the array contains the first matched
     ///   capturing, not the whole match! This is empty unless the `pattern` was
     ///   a regex with capturing groups.
+    ///
+    /// ```example:"Shape of the returned dictionary"
+    /// #let pat = regex("not (a|an) (apple|cat)")
+    /// #"I'm a doctor, not an apple.".match(pat) \
+    /// #"I am not a cat!".match(pat)
+    /// ```
+    ///
+    /// ```example:"Different kinds of patterns"
+    /// #assert.eq("Is there a".match("for this?"), none)
+    /// #"The time of my life.".match(regex("[mit]+e"))
+    /// ```
     #[func]
     pub fn match_(
         &self,
@@ -422,7 +450,11 @@ impl Str {
 
     /// Searches for the specified pattern in the string and returns an array of
     /// dictionaries with details about all matches. For details about the
-    /// returned dictionaries, see above.
+    /// returned dictionaries, see [above]($str.match).
+    ///
+    /// ```example
+    /// #"Day by Day.".matches("Day")
+    /// ```
     #[func]
     pub fn matches(
         &self,
@@ -457,6 +489,9 @@ impl Str {
         /// The string to replace the matches with or a function that gets a
         /// dictionary for each match and can return individual replacement
         /// strings.
+        ///
+        /// The dictionary passed to the function has the same shape as the
+        /// dictionary returned by [`match`]($str.match).
         replacement: Replacement,
         ///  If given, only the first `count` matches of the pattern are placed.
         #[named]
@@ -865,7 +900,11 @@ fn out_of_bounds(index: i64, len: usize) -> EcoString {
 /// The out of bounds access error message when no default value was given.
 #[cold]
 fn no_default_and_out_of_bounds(index: i64, len: usize) -> EcoString {
-    eco_format!("no default value was specified and string index out of bounds (index: {}, len: {})", index, len)
+    eco_format!(
+        "no default value was specified and string index out of bounds (index: {}, len: {})",
+        index,
+        len
+    )
 }
 
 /// The char boundary access error message.
@@ -894,7 +933,7 @@ fn string_is_empty() -> EcoString {
 /// #"a,b;c".split(regex("[,;]"))
 ///
 /// // Works with show rules.
-/// #show regex("\d+"): set text(red)
+/// #show regex("\\d+"): set text(red)
 ///
 /// The numbers 1 to 10.
 /// ```
@@ -916,14 +955,18 @@ impl Regex {
     pub fn construct(
         /// The regular expression as a string.
         ///
-        /// Most regex escape sequences just work because they are not valid Typst
-        /// escape sequences. To produce regex escape sequences that are also valid in
-        /// Typst (e.g. `[\\]`), you need to escape twice. Thus, to match a verbatim
-        /// backslash, you would need to write `{regex("\\\\")}`.
+        /// Both Typst strings and regular expressions use backslashes for
+        /// escaping. To produce a regex escape sequence that is also valid in
+        /// Typst, you need to escape the backslash itself (e.g., writing
+        /// `{regex("\\\\")}` for the regex `\\`). Regex escape sequences that
+        /// are not valid Typst escape sequences (e.g., `\d` and `\b`) can be
+        /// entered into strings directly, but it's good practice to still
+        /// escape them to avoid ambiguity (i.e., `{regex("\\b\\d")}`). See the
+        /// [list of valid string escape sequences]($str/#escapes).
         ///
         /// If you need many escape sequences, you can also create a raw element
         /// and extract its text to use it for your regular expressions:
-        /// ```{regex(`\d+\.\d+\.\d+`.text)}```.
+        /// ``{regex(`\d+\.\d+\.\d+`.text)}``.
         regex: Spanned<Str>,
     ) -> SourceResult<Regex> {
         Self::new(&regex.v).at(regex.span)

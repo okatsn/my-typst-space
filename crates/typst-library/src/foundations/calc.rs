@@ -7,8 +7,8 @@ use az::SaturatingAs;
 use typst_syntax::{Span, Spanned};
 use typst_utils::{round_int_with_precision, round_with_precision};
 
-use crate::diag::{bail, At, HintedString, SourceResult, StrResult};
-use crate::foundations::{cast, func, ops, Decimal, IntoValue, Module, Scope, Value};
+use crate::diag::{At, HintedString, SourceResult, StrResult, bail};
+use crate::foundations::{Decimal, IntoValue, Module, Scope, Value, cast, func, ops};
 use crate::layout::{Angle, Fr, Length, Ratio};
 
 /// A module with calculation definitions.
@@ -207,9 +207,9 @@ pub fn sqrt(
 /// ```
 #[func]
 pub fn root(
-    /// The expression to take the root of
+    /// The expression to take the root of.
     radicand: f64,
-    /// Which root of the radicand to take
+    /// Which root of the radicand to take.
     index: Spanned<i64>,
 ) -> SourceResult<f64> {
     if index.v == 0 {
@@ -317,7 +317,7 @@ pub fn asin(
 /// ```
 #[func(title = "Arccosine")]
 pub fn acos(
-    /// The number whose arcsine to calculate. Must be between -1 and 1.
+    /// The number whose arccosine to calculate. Must be between -1 and 1.
     value: Spanned<Num>,
 ) -> SourceResult<Angle> {
     let val = value.v.float();
@@ -387,7 +387,7 @@ pub fn cosh(
     value.cosh()
 }
 
-/// Calculates the hyperbolic tangent of an hyperbolic angle.
+/// Calculates the hyperbolic tangent of a hyperbolic angle.
 ///
 /// ```example
 /// #calc.tanh(0) \
@@ -564,6 +564,9 @@ fn binom_impl(n: u64, k: u64) -> Option<i64> {
 
 /// Calculates the greatest common divisor of two integers.
 ///
+/// This will error if the result of integer division would be larger than the
+/// maximum 64-bit signed integer.
+///
 /// ```example
 /// #calc.gcd(7, 42)
 /// ```
@@ -573,15 +576,15 @@ pub fn gcd(
     a: i64,
     /// The second integer.
     b: i64,
-) -> i64 {
+) -> StrResult<i64> {
     let (mut a, mut b) = (a, b);
     while b != 0 {
         let temp = b;
-        b = a % b;
+        b = a.checked_rem(b).ok_or_else(too_large)?;
         a = temp;
     }
 
-    a.abs()
+    Ok(a.abs())
 }
 
 /// Calculates the least common multiple of two integers.
@@ -600,7 +603,7 @@ pub fn lcm(
         return Ok(a.abs());
     }
 
-    Ok(a.checked_div(gcd(a, b))
+    Ok(a.checked_div(gcd(a, b)?)
         .and_then(|gcd| gcd.checked_mul(b))
         .map(|v| v.abs())
         .ok_or_else(too_large)?)
@@ -708,12 +711,13 @@ pub fn fract(
     }
 }
 
-/// Rounds a number to the nearest integer away from zero.
+/// Rounds a number to the nearest integer.
 ///
-/// Optionally, a number of decimal places can be specified.
+/// Half-integers are rounded away from zero.
 ///
-/// If the number of digits is negative, its absolute value will indicate the
-/// amount of significant integer digits to remove before the decimal point.
+/// Optionally, a number of decimal places can be specified. If negative, its
+/// absolute value will indicate the amount of significant integer digits to
+/// remove before the decimal point.
 ///
 /// Note that this function will return the same type as the operand. That is,
 /// applying `round` to a [`float`] will return a `float`, and to a [`decimal`],
@@ -917,7 +921,9 @@ pub fn rem(
     dividend
         .apply2(
             divisor.v,
-            |a, b| Some(DecNum::Int(a % b)),
+            // `checked_rem` can only overflow on `i64::MIN % -1` which is
+            // mathematically zero.
+            |a, b| Some(DecNum::Int(a.checked_rem(b).unwrap_or(0))),
             |a, b| Some(DecNum::Float(a % b)),
             |a, b| a.checked_rem(b).map(DecNum::Decimal),
         )
@@ -930,7 +936,11 @@ pub fn rem(
 /// Performs euclidean division of two numbers.
 ///
 /// The result of this computation is that of a division rounded to the integer
-/// `{n}` such that the dividend is greater than or equal to `{n}` times the divisor.
+/// `{n}` such that the dividend is greater than or equal to `{n}` times
+/// the divisor.
+///
+/// This can error if the resulting number is larger than the maximum value or
+/// smaller than the minimum value for its type.
 ///
 /// ```example
 /// #calc.div-euclid(7, 3) \
@@ -955,7 +965,7 @@ pub fn div_euclid(
     dividend
         .apply2(
             divisor.v,
-            |a, b| Some(DecNum::Int(a.div_euclid(b))),
+            |a, b| a.checked_div_euclid(b).map(DecNum::Int),
             |a, b| Some(DecNum::Float(a.div_euclid(b))),
             |a, b| a.checked_div_euclid(b).map(DecNum::Decimal),
         )
@@ -998,7 +1008,9 @@ pub fn rem_euclid(
     dividend
         .apply2(
             divisor.v,
-            |a, b| Some(DecNum::Int(a.rem_euclid(b))),
+            // `checked_rem_euclid` can only overflow on `i64::MIN % -1` which
+            // is mathematically zero.
+            |a, b| Some(DecNum::Int(a.checked_rem_euclid(b).unwrap_or(0))),
             |a, b| Some(DecNum::Float(a.rem_euclid(b))),
             |a, b| a.checked_rem_euclid(b).map(DecNum::Decimal),
         )
@@ -1011,8 +1023,8 @@ pub fn rem_euclid(
 /// Calculates the quotient (floored division) of two numbers.
 ///
 /// Note that this function will always return an [integer]($int), and will
-/// error if the resulting [`float`] or [`decimal`] is larger than the maximum
-/// 64-bit signed integer or smaller than the minimum for that type.
+/// error if the resulting number is larger than the maximum 64-bit signed
+/// integer or smaller than the minimum for that type.
 ///
 /// ```example
 /// $ "quo"(a, b) &= floor(a/b) \
@@ -1034,7 +1046,7 @@ pub fn quo(
     let divided = dividend
         .apply2(
             divisor.v,
-            |a, b| Some(DecNum::Int(a / b)),
+            |a, b| a.checked_div(b).map(DecNum::Int),
             |a, b| Some(DecNum::Float(a / b)),
             |a, b| a.checked_div(b).map(DecNum::Decimal),
         )

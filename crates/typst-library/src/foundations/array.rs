@@ -4,16 +4,18 @@ use std::num::{NonZeroI64, NonZeroUsize};
 use std::ops::{Add, AddAssign};
 
 use comemo::Tracked;
-use ecow::{eco_format, EcoString, EcoVec};
+use ecow::{EcoString, EcoVec, eco_format};
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use typst_syntax::{Span, Spanned};
 
-use crate::diag::{bail, At, HintedStrResult, SourceDiagnostic, SourceResult, StrResult};
+use crate::diag::{
+    At, HintedStrResult, HintedString, SourceDiagnostic, SourceResult, StrResult, bail,
+};
 use crate::engine::Engine;
 use crate::foundations::{
-    cast, func, ops, repr, scope, ty, Args, Bytes, CastInfo, Context, Dict, FromValue,
-    Func, IntoValue, Reflect, Repr, Str, Value, Version,
+    Args, Bytes, CastInfo, Context, Dict, FromValue, Func, IntoValue, Reflect, Repr, Str,
+    Value, Version, cast, func, ops, repr, scope, ty,
 };
 
 /// Create a new [`Array`] from values.
@@ -94,7 +96,7 @@ impl Array {
     }
 
     /// Iterate over references to the contained values.
-    pub fn iter(&self) -> std::slice::Iter<Value> {
+    pub fn iter(&self) -> std::slice::Iter<'_, Value> {
         self.0.iter()
     }
 
@@ -286,11 +288,8 @@ impl Array {
         #[named]
         count: Option<i64>,
     ) -> StrResult<Array> {
-        let mut end = end;
-        if end.is_none() {
-            end = count.map(|c: i64| start + c);
-        }
         let start = self.locate(start, true)?;
+        let end = end.or(count.map(|c| start as i64 + c));
         let end = self.locate(end.unwrap_or(self.len() as i64), true)?.max(start);
         Ok(self.0[start..end].into())
     }
@@ -446,6 +445,14 @@ impl Array {
     /// The returned array consists of `(index, value)` pairs in the form of
     /// length-2 arrays. These can be [destructured]($scripting/#bindings) with
     /// a let binding or for loop.
+    ///
+    /// ```example
+    /// #for (i, value) in ("A", "B", "C").enumerate() {
+    ///   [#i: #value \ ]
+    /// }
+    ///
+    /// #("A", "B", "C").enumerate(start: 1)
+    /// ```
     #[func]
     pub fn enumerate(
         self,
@@ -566,6 +573,11 @@ impl Array {
     }
 
     /// Folds all items into a single value using an accumulator function.
+    ///
+    /// ```example
+    /// #let array = (1, 2, 3, 4)
+    /// #array.fold(0, (acc, x) => acc + x)
+    /// ```
     #[func]
     pub fn fold(
         self,
@@ -604,7 +616,7 @@ impl Array {
         Ok(acc)
     }
 
-    /// Calculates the product all items (works for all types that can be
+    /// Calculates the product of all items (works for all types that can be
     /// multiplied).
     #[func]
     pub fn product(
@@ -682,6 +694,10 @@ impl Array {
     }
 
     /// Split the array at occurrences of the specified value.
+    ///
+    /// ```example
+    /// #(1, 1, 2, 3, 2, 4, 5).split(2)
+    /// ```
     #[func]
     pub fn split(
         &self,
@@ -704,8 +720,19 @@ impl Array {
         /// An alternative separator between the last two items.
         #[named]
         last: Option<Value>,
+        /// What to return if the array is empty.
+        #[named]
+        #[default]
+        default: Option<Value>,
     ) -> StrResult<Value> {
         let len = self.0.len();
+
+        if let Some(result) = default
+            && len == 0
+        {
+            return Ok(result);
+        }
+
         let separator = separator.unwrap_or(Value::None);
 
         let mut last = last;
@@ -727,6 +754,10 @@ impl Array {
 
     /// Returns an array with a copy of the separator value placed between
     /// adjacent elements.
+    ///
+    /// ```example
+    /// #("A", "B", "C").intersperse("-")
+    /// ```
     #[func]
     pub fn intersperse(
         self,
@@ -807,8 +838,9 @@ impl Array {
     /// Return a sorted version of this array, optionally by a given key
     /// function. The sorting algorithm used is stable.
     ///
-    /// Returns an error if two values could not be compared or if the key
-    /// or comparison function (if given) yields an error.
+    /// Returns an error if a pair of values selected for comparison could not
+    /// be compared, or if the key or comparison function (if given) yield an
+    /// error.
     ///
     /// To sort according to multiple criteria at once, e.g. in case of equality
     /// between some criteria, the key function can return an array. The results
@@ -828,16 +860,18 @@ impl Array {
         engine: &mut Engine,
         context: Tracked<Context>,
         span: Span,
-        /// If given, applies this function to the elements in the array to
+        /// If given, applies this function to each element in the array to
         /// determine the keys to sort by.
         #[named]
         key: Option<Func>,
-        /// If given, uses this function to compare elements in the array.
+        /// If given, uses this function to compare every two elements in the
+        /// array.
         ///
-        /// This function should return a boolean: `{true}` indicates that the
-        /// elements are in order, while `{false}` indicates that they should be
-        /// swapped. To keep the sort stable, if the two elements are equal, the
-        /// function should return `{true}`.
+        /// The function will receive two elements in the array for comparison,
+        /// and should return a boolean indicating their order: `{true}`
+        /// indicates that the elements are in order, while `{false}` indicates
+        /// that they should be swapped. To keep the sort stable, if the two
+        /// elements are equal, the function should return `{true}`.
         ///
         /// If this function does not order the elements properly (e.g., by
         /// returning `{false}` for both `{(x, y)}` and `{(y, x)}`, or for
@@ -860,6 +894,10 @@ impl Array {
         #[named]
         by: Option<Func>,
     ) -> SourceResult<Array> {
+        // We use `glidesort` instead of the standard library sorting algorithm
+        // to prevent panics in case the comparison function does not define a
+        // valid order (see https://github.com/typst/typst/pull/5627 and
+        // https://github.com/typst/typst/issues/6285).
         match by {
             Some(by) => {
                 let mut are_in_order = |mut x, mut y| {
@@ -880,10 +918,7 @@ impl Array {
                         }
                     }
                 };
-                // If a comparison function is provided, we use `glidesort`
-                // instead of the standard library sorting algorithm to prevent
-                // panics in case the comparison function does not define a
-                // valid order (see https://github.com/typst/typst/pull/5627).
+
                 let mut result = Ok(());
                 let mut vec = self.0.into_iter().enumerate().collect::<Vec<_>>();
                 glidesort::sort_by(&mut vec, |(i, x), (j, y)| {
@@ -936,16 +971,25 @@ impl Array {
                     Some(f) => f.call(engine, context, [x]),
                     None => Ok(x),
                 };
-                // If no comparison function is provided, we know the order is
-                // valid, so we can use the standard library sort and prevent an
-                // extra allocation.
+
                 let mut result = Ok(());
                 let mut vec = self.0;
-                vec.make_mut().sort_by(|a, b| {
+                glidesort::sort_by(vec.make_mut(), |a, b| {
                     match (key_of(a.clone()), key_of(b.clone())) {
                         (Ok(a), Ok(b)) => ops::compare(&a, &b).unwrap_or_else(|err| {
                             if result.is_ok() {
-                                result = Err(err).at(span);
+                                result =
+                                    Err(HintedString::from(err).with_hint(match key {
+                                        None => {
+                                            "consider choosing a `key` \
+                                             or defining the comparison with `by`"
+                                        }
+                                        Some(_) => {
+                                            "consider defining the comparison with `by` \
+                                             or choosing a different `key`"
+                                        }
+                                    }))
+                                    .at(span);
                             }
                             Ordering::Equal
                         }),
@@ -968,15 +1012,19 @@ impl Array {
     /// element of each duplicate is kept.
     ///
     /// ```example
-    /// #(1, 1, 2, 3, 1).dedup()
+    /// #(3, 3, 1, 2, 3).dedup()
     /// ```
     #[func(title = "Deduplicate")]
     pub fn dedup(
         self,
         engine: &mut Engine,
         context: Tracked<Context>,
-        /// If given, applies this function to the elements in the array to
+        /// If given, applies this function to each element in the array to
         /// determine the keys to deduplicate by.
+        ///
+        /// ```example
+        /// #("apple", "banana", " apple ").dedup(key: s => s.trim())
+        /// ```
         #[named]
         key: Option<Func>,
     ) -> SourceResult<Array> {
@@ -1054,6 +1102,11 @@ impl Array {
     /// For arrays with at least one element, this is the same as [`array.fold`]
     /// with the first element of the array as the initial accumulator value,
     /// folding every subsequent element into it.
+    ///
+    /// ```example
+    /// #let array = (2, 1, 4, 3)
+    /// #array.reduce((acc, x) => calc.max(acc, x))
+    /// ```
     #[func]
     pub fn reduce(
         self,

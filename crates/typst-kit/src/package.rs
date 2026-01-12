@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use ecow::eco_format;
 use once_cell::sync::OnceCell;
 use serde::Deserialize;
-use typst_library::diag::{bail, PackageError, PackageResult, StrResult};
+use typst_library::diag::{PackageError, PackageResult, StrResult, bail};
 use typst_syntax::package::{PackageSpec, PackageVersion, VersionlessPackageSpec};
 
 use crate::download::{Downloader, Progress};
@@ -20,6 +20,24 @@ pub const DEFAULT_NAMESPACE: &str = "preview";
 
 /// The default packages sub directory within the package and package cache paths.
 pub const DEFAULT_PACKAGES_SUBDIR: &str = "typst/packages";
+
+/// Attempts to infer the default package cache directory from the current
+/// environment.
+///
+/// This simply joins [`DEFAULT_PACKAGES_SUBDIR`] to the output of
+/// [`dirs::cache_dir`].
+pub fn default_package_cache_path() -> Option<PathBuf> {
+    dirs::cache_dir().map(|cache_dir| cache_dir.join(DEFAULT_PACKAGES_SUBDIR))
+}
+
+/// Attempts to infer the default package directory from the current
+/// environment.
+///
+/// This simply joins [`DEFAULT_PACKAGES_SUBDIR`] to the output of
+/// [`dirs::data_dir`].
+pub fn default_package_path() -> Option<PathBuf> {
+    dirs::data_dir().map(|data_dir| data_dir.join(DEFAULT_PACKAGES_SUBDIR))
+}
 
 /// Holds information about where packages should be stored and downloads them
 /// on demand, if possible.
@@ -56,12 +74,8 @@ impl PackageStorage {
         index: OnceCell<Vec<serde_json::Value>>,
     ) -> Self {
         Self {
-            package_cache_path: package_cache_path.or_else(|| {
-                dirs::cache_dir().map(|cache_dir| cache_dir.join(DEFAULT_PACKAGES_SUBDIR))
-            }),
-            package_path: package_path.or_else(|| {
-                dirs::data_dir().map(|data_dir| data_dir.join(DEFAULT_PACKAGES_SUBDIR))
-            }),
+            package_cache_path: package_cache_path.or_else(default_package_cache_path),
+            package_path: package_path.or_else(default_package_path),
             downloader,
             index,
         }
@@ -189,7 +203,7 @@ impl PackageStorage {
                 }
             }
             Err(err) => {
-                return Err(PackageError::NetworkFailed(Some(eco_format!("{err}"))))
+                return Err(PackageError::NetworkFailed(Some(eco_format!("{err}"))));
             }
         };
 
@@ -199,7 +213,7 @@ impl PackageStorage {
         // The place at which the specific package version will live in the end.
         let package_dir = base_dir.join(format!("{}", spec.version));
 
-        // To prevent multiple Typst instances from interferring, we download
+        // To prevent multiple Typst instances from interfering, we download
         // into a temporary directory first and then move this directory to
         // its final destination.
         //
