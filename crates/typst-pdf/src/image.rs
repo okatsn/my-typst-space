@@ -1,19 +1,23 @@
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, OnceLock};
 
+use ecow::eco_format;
 use image::{DynamicImage, EncodableLayout, GenericImageView, Rgba};
 use krilla::image::{BitsPerComponent, CustomImage, ImageColorspace};
+use krilla::pdf::PdfDocument;
 use krilla::surface::Surface;
 use krilla_svg::{SurfaceExt, SvgSettings};
-use typst_library::diag::{bail, SourceResult};
+use typst_library::diag::{At, SourceResult};
 use typst_library::foundations::Smart;
 use typst_library::layout::{Abs, Angle, Ratio, Size, Transform};
 use typst_library::visualize::{
-    ExchangeFormat, Image, ImageKind, ImageScaling, RasterFormat, RasterImage,
+    ExchangeFormat, Image, ImageKind, ImageScaling, PdfImage, RasterFormat, RasterImage,
 };
 use typst_syntax::Span;
+use typst_utils::defer;
 
 use crate::convert::{FrameContext, GlobalContext};
+use crate::tags;
 use crate::util::{SizeExt, TransformExt};
 
 #[typst_macros::time(name = "handle image")]
@@ -26,48 +30,52 @@ pub(crate) fn handle_image(
     span: Span,
 ) -> SourceResult<()> {
     surface.push_transform(&fc.state().transform().to_krilla());
-    surface.set_location(span.into_raw().get());
+    surface.set_location(span.into_raw());
+    let mut surface = defer(surface, |s| {
+        s.pop();
+        s.reset_location();
+    });
 
     let interpolate = image.scaling() == Smart::Custom(ImageScaling::Smooth);
 
-    if let Some(alt) = image.alt() {
-        surface.start_alt_text(alt);
-    }
-
     gc.image_spans.insert(span);
+
+    let mut handle = tags::image(gc, fc, &mut surface, image, size);
+    let surface = handle.surface();
 
     match image.kind() {
         ImageKind::Raster(raster) => {
             let (exif_transform, new_size) = exif_transform(raster, size);
             surface.push_transform(&exif_transform.to_krilla());
+            let mut surface = defer(surface, |s| s.pop());
 
-            let image = match convert_raster(raster.clone(), interpolate) {
-                None => bail!(span, "failed to process image"),
-                Some(i) => i,
-            };
+            let image = convert_raster(raster.clone(), interpolate)
+                .map_err(|err| eco_format!("failed to process image ({err})"))
+                .at(span)?;
 
             if !gc.image_to_spans.contains_key(&image) {
                 gc.image_to_spans.insert(image.clone(), span);
             }
 
-            surface.draw_image(image, new_size.to_krilla());
-            surface.pop();
+            if let Some(size) = new_size.to_krilla() {
+                surface.draw_image(image, size);
+            }
         }
         ImageKind::Svg(svg) => {
-            surface.draw_svg(
-                svg.tree(),
-                size.to_krilla(),
-                SvgSettings { embed_text: true, ..Default::default() },
-            );
+            if let Some(size) = size.to_krilla() {
+                surface.draw_svg(
+                    svg.tree(),
+                    size,
+                    SvgSettings { embed_text: true, ..Default::default() },
+                );
+            }
+        }
+        ImageKind::Pdf(pdf) => {
+            if let Some(size) = size.to_krilla() {
+                surface.draw_pdf_page(&convert_pdf(pdf), size, pdf.page_index());
+            }
         }
     }
-
-    if image.alt().is_some() {
-        surface.end_alt_text();
-    }
-
-    surface.pop();
-    surface.reset_location();
 
     Ok(())
 }
@@ -85,9 +93,9 @@ struct Repr {
 
 /// A wrapper around `RasterImage` so that we can implement `CustomImage`.
 #[derive(Clone)]
-struct PdfImage(Arc<Repr>);
+struct PdfRasterImage(Arc<Repr>);
 
-impl PdfImage {
+impl PdfRasterImage {
     pub fn new(raster: RasterImage) -> Self {
         Self(Arc::new(Repr {
             raster,
@@ -97,7 +105,7 @@ impl PdfImage {
     }
 }
 
-impl Hash for PdfImage {
+impl Hash for PdfRasterImage {
     fn hash<H: Hasher>(&self, state: &mut H) {
         // `alpha_channel` and `actual_dynamic` are generated from the underlying `RasterImage`,
         // so this is enough. Since `raster` is prehashed, this is also very cheap.
@@ -105,7 +113,7 @@ impl Hash for PdfImage {
     }
 }
 
-impl CustomImage for PdfImage {
+impl CustomImage for PdfRasterImage {
     fn color_channel(&self) -> &[u8] {
         self.0
             .actual_dynamic
@@ -181,7 +189,7 @@ impl CustomImage for PdfImage {
 fn convert_raster(
     raster: RasterImage,
     interpolate: bool,
-) -> Option<krilla::image::Image> {
+) -> Result<krilla::image::Image, String> {
     if let RasterFormat::Exchange(ExchangeFormat::Jpg) = raster.format() {
         let image_data: Arc<dyn AsRef<[u8]> + Send + Sync> =
             Arc::new(raster.data().clone());
@@ -196,11 +204,23 @@ fn convert_raster(
             interpolate,
         )
     } else {
-        krilla::image::Image::from_custom(PdfImage::new(raster), interpolate)
+        krilla::image::Image::from_custom(PdfRasterImage::new(raster), interpolate)
     }
 }
 
+#[comemo::memoize]
+fn convert_pdf(pdf: &PdfImage) -> PdfDocument {
+    PdfDocument::new(pdf.document().pdf().clone())
+}
+
 fn exif_transform(image: &RasterImage, size: Size) -> (Transform, Size) {
+    // For JPEGs, we want to apply the EXIF orientation as a transformation
+    // because we don't recode them. For other formats, the transform is already
+    // baked into the dynamic image data.
+    if image.format() != RasterFormat::Exchange(ExchangeFormat::Jpg) {
+        return (Transform::identity(), size);
+    }
+
     let base = |hp: bool, vp: bool, mut base_ts: Transform, size: Size| {
         if hp {
             // Flip horizontally in-place.
@@ -236,9 +256,9 @@ fn exif_transform(image: &RasterImage, size: Size) -> (Transform, Size) {
         Some(3) => no_flipping(true, true),
         Some(4) => no_flipping(false, true),
         Some(5) => with_flipping(false, false),
-        Some(6) => with_flipping(true, false),
+        Some(6) => with_flipping(false, true),
         Some(7) => with_flipping(true, true),
-        Some(8) => with_flipping(false, true),
+        Some(8) => with_flipping(true, false),
         _ => no_flipping(false, false),
     }
 }

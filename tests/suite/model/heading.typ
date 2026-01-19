@@ -1,6 +1,6 @@
 // Test headings.
 
---- heading-basic ---
+--- heading-basic render ---
 // Different number of equals signs.
 
 = Level 1
@@ -82,7 +82,7 @@ comment spans lines
 ===== Heading 🌍
 #heading(level: 5)[Heading]
 
---- heading-offset ---
+--- heading-offset render pdftags ---
 // Test setting the starting offset.
 #set heading(numbering: "1.1")
 #show heading.where(level: 2): set text(blue)
@@ -100,6 +100,11 @@ comment spans lines
 --- heading-hanging-indent-auto ---
 #set heading(numbering: "1.1.a.")
 = State of the Art
+
+--- heading-hanging-indent-auto-center-align ---
+#set heading(numbering: "1.1.a.")
+#show heading: set align(center)
+= Center aligned
 
 --- heading-hanging-indent-zero ---
 #set heading(numbering: "1.1.a.", hanging-indent: 0pt)
@@ -157,3 +162,12 @@ Cannot be used as @intro
 --- issue-5719-heading-nested ---
 // Headings may not be nested like this.
 = = A
+
+--- issue-7428-heading-numbering-errors ---
+// Ensure that the error from the first layout iteration is silenced.
+#set heading(numbering: (n, ..nums) => {
+  assert(n > 0)
+  [#n]
+})
+
+= A

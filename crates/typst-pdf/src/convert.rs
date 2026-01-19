@@ -1,44 +1,91 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::num::NonZeroU64;
-
-use ecow::{eco_format, EcoVec};
-use krilla::annotation::Annotation;
+use ecow::{EcoVec, eco_format};
+use indexmap::IndexMap;
 use krilla::configure::{Configuration, ValidationError, Validator};
-use krilla::destination::{NamedDestination, XyzDestination};
+use krilla::destination::NamedDestination;
 use krilla::embed::EmbedError;
 use krilla::error::KrillaError;
 use krilla::geom::PathBuilder;
 use krilla::page::{PageLabel, PageSettings};
+use krilla::pdf::PdfError;
 use krilla::surface::Surface;
+use krilla::tagging::fmt::Output;
 use krilla::{Document, SerializeSettings};
 use krilla_svg::render_svg_glyph;
-use typst_library::diag::{bail, error, SourceDiagnostic, SourceResult};
-use typst_library::foundations::NativeElement;
-use typst_library::introspection::Location;
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
+use smallvec::SmallVec;
+use typst_library::diag::{
+    At, ExpectInternal, SourceDiagnostic, SourceResult, bail, error,
+};
+use typst_library::foundations::{NativeElement, Repr};
+use typst_library::introspection::{Location, Tag};
 use typst_library::layout::{
-    Abs, Frame, FrameItem, GroupItem, PagedDocument, Size, Transform,
+    Frame, FrameItem, GroupItem, PagedDocument, Size, Transform,
 };
 use typst_library::model::HeadingElem;
-use typst_library::text::{Font, Lang};
+use typst_library::text::{Font, Locale};
 use typst_library::visualize::{Geometry, Paint};
 use typst_syntax::Span;
 
-use crate::embed::embed_files;
+use crate::PdfOptions;
+use crate::attach::attach_files;
 use crate::image::handle_image;
-use crate::link::handle_link;
+use crate::link::{LinkAnnotation, handle_link};
 use crate::metadata::build_metadata;
 use crate::outline::build_outline;
 use crate::page::PageLabelExt;
 use crate::shape::handle_shape;
+use crate::tags::{self, GroupId, Tags};
 use crate::text::handle_text;
-use crate::util::{convert_path, display_font, AbsExt, TransformExt};
-use crate::PdfOptions;
+use crate::util::{AbsExt, TransformExt, convert_path, display_font};
 
 #[typst_macros::time(name = "convert document")]
 pub fn convert(
     typst_document: &PagedDocument,
     options: &PdfOptions,
 ) -> SourceResult<Vec<u8>> {
+    let (mut document, mut gc) = setup(typst_document, options)?;
+
+    convert_pages(&mut gc, &mut document)?;
+    attach_files(&gc, &mut document)?;
+    let (doc_lang, tree) = tags::resolve(&mut gc)?;
+
+    document.set_outline(build_outline(&gc));
+    document.set_metadata(build_metadata(&gc, doc_lang));
+    document.set_tag_tree(tree);
+
+    finish(document, gc, options.standards.config)
+}
+
+pub fn tag_tree(
+    typst_document: &PagedDocument,
+    options: &PdfOptions,
+) -> SourceResult<String> {
+    let (mut document, mut gc) = setup(typst_document, options)?;
+    convert_pages(&mut gc, &mut document)?;
+    attach_files(&gc, &mut document)?;
+    let (doc_lang, tree) = tags::resolve(&mut gc)?;
+
+    let mut output = String::new();
+    if let Some(lang) = doc_lang
+        && lang != Locale::DEFAULT
+    {
+        output = format!("lang: \"{}\"\n---\n", lang.rfc_3066());
+    }
+    tree.output(&mut output).unwrap();
+
+    document.set_outline(build_outline(&gc));
+    document.set_metadata(build_metadata(&gc, doc_lang));
+    document.set_tag_tree(tree);
+
+    finish(document, gc, options.standards.config)?;
+
+    Ok(output)
+}
+
+fn setup<'a>(
+    typst_document: &'a PagedDocument,
+    options: &'a PdfOptions,
+) -> SourceResult<(Document, GlobalContext<'a>)> {
     let settings = SerializeSettings {
         compress_content_streams: true,
         no_device_cs: true,
@@ -46,28 +93,25 @@ pub fn convert(
         xmp_metadata: true,
         cmyk_profile: None,
         configuration: options.standards.config,
-        enable_tagging: false,
+        enable_tagging: options.tagged,
         render_svg_glyph_fn: render_svg_glyph,
     };
 
-    let mut document = Document::new_with(settings);
+    let document = Document::new_with(settings);
     let page_index_converter = PageIndexConverter::new(typst_document, options);
     let named_destinations =
         collect_named_destinations(typst_document, &page_index_converter);
-    let mut gc = GlobalContext::new(
+    let tags = tags::init(typst_document, options)?;
+
+    let gc = GlobalContext::new(
         typst_document,
         options,
         named_destinations,
         page_index_converter,
+        tags,
     );
 
-    convert_pages(&mut gc, &mut document)?;
-    embed_files(typst_document, &mut document)?;
-
-    document.set_outline(build_outline(&gc));
-    document.set_metadata(build_metadata(&gc));
-
-    finish(document, gc, options.standards.config)
+    Ok((document, gc))
 }
 
 fn convert_pages(gc: &mut GlobalContext, document: &mut Document) -> SourceResult<()> {
@@ -76,10 +120,15 @@ fn convert_pages(gc: &mut GlobalContext, document: &mut Document) -> SourceResul
             // Don't export this page.
             continue;
         } else {
-            let mut settings = PageSettings::new(
-                typst_page.frame.width().to_f32(),
-                typst_page.frame.height().to_f32(),
-            );
+            // PDF 1.4 upwards to 1.7 specifies a minimum page size of 3x3 units.
+            // PDF 2.0 doesn't define an explicit limit, but krilla and probably
+            // some viewers won't handle pages that have zero sized pages.
+            let mut settings = PageSettings::from_wh(
+                typst_page.frame.width().to_f32().max(3.0),
+                typst_page.frame.height().to_f32().max(3.0),
+            )
+            .expect_internal("invalid page size")
+            .at(Span::detached())?;
 
             if let Some(label) = typst_page
                 .numbering
@@ -103,21 +152,23 @@ fn convert_pages(gc: &mut GlobalContext, document: &mut Document) -> SourceResul
 
             let mut page = document.start_page_with(settings);
             let mut surface = page.surface();
-            let mut fc = FrameContext::new(typst_page.frame.size());
+            let page_idx = gc.page_index_converter.pdf_page_index(i);
+            let mut fc = FrameContext::new(page_idx, typst_page.frame.size());
 
-            handle_frame(
-                &mut fc,
-                &typst_page.frame,
-                typst_page.fill_or_transparent(),
-                &mut surface,
-                gc,
-            )?;
+            tags::page(gc, &mut surface, |gc, surface| {
+                handle_frame(
+                    &mut fc,
+                    &typst_page.frame,
+                    typst_page.fill_or_transparent(),
+                    surface,
+                    gc,
+                )
+            })?;
 
             surface.finish();
 
-            for annotation in fc.annotations {
-                page.add_annotation(annotation);
-            }
+            let link_annotations = fc.link_annotations.into_values().flatten();
+            tags::add_link_annotations(gc, &mut page, link_annotations);
         }
     }
 
@@ -170,15 +221,20 @@ impl State {
 
 /// Context needed for converting a single frame.
 pub(crate) struct FrameContext {
+    /// The logical page index. This might be `None` if the page isn't exported,
+    /// of if the FrameContext has been built to convert a pattern.
+    pub(crate) page_idx: Option<usize>,
     states: Vec<State>,
-    annotations: Vec<Annotation>,
+    /// The link annotations belonging to a Link tag.
+    link_annotations: IndexMap<GroupId, SmallVec<[LinkAnnotation; 1]>, FxBuildHasher>,
 }
 
 impl FrameContext {
-    pub(crate) fn new(size: Size) -> Self {
+    pub(crate) fn new(page_idx: Option<usize>, size: Size) -> Self {
         Self {
+            page_idx,
             states: vec![State::new(size)],
-            annotations: vec![],
+            link_annotations: IndexMap::default(),
         }
     }
 
@@ -198,52 +254,65 @@ impl FrameContext {
         self.states.last_mut().unwrap()
     }
 
-    pub(crate) fn push_annotation(&mut self, annotation: Annotation) {
-        self.annotations.push(annotation);
+    pub(crate) fn get_link_annotation(
+        &mut self,
+        id: GroupId,
+    ) -> Option<&mut LinkAnnotation> {
+        self.link_annotations.get_mut(&id)?.last_mut()
+    }
+
+    pub(crate) fn push_link_annotation(
+        &mut self,
+        id: GroupId,
+        annotation: LinkAnnotation,
+    ) {
+        let annotations = self.link_annotations.entry(id).or_default();
+        annotations.push(annotation);
     }
 }
 
-/// Globally needed context for converting a typst document.
+/// Globally needed context for converting a Typst document.
 pub(crate) struct GlobalContext<'a> {
     /// Cache the conversion between krilla and Typst fonts (forward and backward).
-    pub(crate) fonts_forward: HashMap<Font, krilla::text::Font>,
-    pub(crate) fonts_backward: HashMap<krilla::text::Font, Font>,
+    pub(crate) fonts_forward: FxHashMap<Font, krilla::text::Font>,
+    pub(crate) fonts_backward: FxHashMap<krilla::text::Font, Font>,
     /// Mapping between images and their span.
     // Note: In theory, the same image can have multiple spans
     // if it appears in the document multiple times. We just store the
     // first appearance, though.
-    pub(crate) image_to_spans: HashMap<krilla::image::Image, Span>,
+    pub(crate) image_to_spans: FxHashMap<krilla::image::Image, Span>,
     /// The spans of all images that appear in the document. We use this so
     /// we can give more accurate error messages.
-    pub(crate) image_spans: HashSet<Span>,
+    pub(crate) image_spans: FxHashSet<Span>,
     /// The document to convert.
     pub(crate) document: &'a PagedDocument,
     /// Options for PDF export.
     pub(crate) options: &'a PdfOptions<'a>,
     /// Mapping between locations in the document and named destinations.
-    pub(crate) loc_to_names: HashMap<Location, NamedDestination>,
-    /// The languages used throughout the document.
-    pub(crate) languages: BTreeMap<Lang, usize>,
+    pub(crate) loc_to_names: FxHashMap<Location, NamedDestination>,
     pub(crate) page_index_converter: PageIndexConverter,
+    /// Tagged PDF context.
+    pub(crate) tags: Tags,
 }
 
 impl<'a> GlobalContext<'a> {
     pub(crate) fn new(
         document: &'a PagedDocument,
         options: &'a PdfOptions,
-        loc_to_names: HashMap<Location, NamedDestination>,
+        loc_to_names: FxHashMap<Location, NamedDestination>,
         page_index_converter: PageIndexConverter,
+        tags: Tags,
     ) -> GlobalContext<'a> {
         Self {
-            fonts_forward: HashMap::new(),
-            fonts_backward: HashMap::new(),
+            fonts_forward: FxHashMap::default(),
+            fonts_backward: FxHashMap::default(),
             document,
             options,
             loc_to_names,
-            image_to_spans: HashMap::new(),
-            image_spans: HashSet::new(),
-            languages: BTreeMap::new(),
+            image_to_spans: FxHashMap::default(),
+            image_spans: FxHashSet::default(),
             page_index_converter,
+            tags,
         }
     }
 }
@@ -278,8 +347,17 @@ pub(crate) fn handle_frame(
             FrameItem::Image(image, size, span) => {
                 handle_image(gc, fc, image, *size, surface, *span)?
             }
-            FrameItem::Link(d, s) => handle_link(fc, gc, d, *s),
-            FrameItem::Tag(_) => {}
+            FrameItem::Link(dest, size) => handle_link(fc, gc, dest, *size)?,
+            FrameItem::Tag(Tag::Start(_, flags)) => {
+                if flags.tagged {
+                    tags::handle_start(gc, surface);
+                }
+            }
+            FrameItem::Tag(Tag::End(_, _, flags)) => {
+                if flags.tagged {
+                    tags::handle_end(gc, surface);
+                }
+            }
         }
 
         fc.pop();
@@ -294,38 +372,42 @@ pub(crate) fn handle_group(
     fc: &mut FrameContext,
     group: &GroupItem,
     surface: &mut Surface,
-    context: &mut GlobalContext,
+    gc: &mut GlobalContext,
 ) -> SourceResult<()> {
     fc.push();
     fc.state_mut().pre_concat(group.transform);
 
-    let clip_path = group
-        .clip
-        .as_ref()
-        .and_then(|p| {
-            let mut builder = PathBuilder::new();
-            convert_path(p, &mut builder);
-            builder.finish()
-        })
-        .and_then(|p| p.transform(fc.state().transform.to_krilla()));
+    tags::group(gc, surface, group.parent, |gc, surface| -> SourceResult<()> {
+        let clip_path = group
+            .clip
+            .as_ref()
+            .and_then(|p| {
+                let mut builder = PathBuilder::new();
+                convert_path(p, &mut builder);
+                builder.finish()
+            })
+            .and_then(|p| p.transform(fc.state().transform.to_krilla()));
 
-    if let Some(clip_path) = &clip_path {
-        surface.push_clip_path(clip_path, &krilla::paint::FillRule::NonZero);
-    }
+        if let Some(clip_path) = &clip_path {
+            surface.push_clip_path(clip_path, &krilla::paint::FillRule::NonZero);
+        }
 
-    handle_frame(fc, &group.frame, None, surface, context)?;
+        let res = handle_frame(fc, &group.frame, None, surface, gc);
 
-    if clip_path.is_some() {
-        surface.pop();
-    }
+        if clip_path.is_some() {
+            surface.pop();
+        }
+
+        res
+    })?;
 
     fc.pop();
 
     Ok(())
 }
 
-#[typst_macros::time(name = "finish export")]
 /// Finish a krilla document and handle export errors.
+#[typst_macros::time(name = "finish export")]
 fn finish(
     document: Document,
     gc: GlobalContext,
@@ -336,11 +418,11 @@ fn finish(
     match document.finish() {
         Ok(r) => Ok(r),
         Err(e) => match e {
-            KrillaError::Font(f, s) => {
-                let font_str = display_font(gc.fonts_backward.get(&f).unwrap());
+            KrillaError::Font(f, err) => {
                 bail!(
                     Span::detached(),
-                    "failed to process font {font_str}: {s}";
+                    "failed to process {} ({err})",
+                    display_font(gc.fonts_backward.get(&f));
                     hint: "make sure the font is valid";
                     hint: "the used font might be unsupported by Typst"
                 );
@@ -352,9 +434,9 @@ fn finish(
                     .collect::<EcoVec<_>>();
                 Err(errors)
             }
-            KrillaError::Image(_, loc) => {
+            KrillaError::Image(_, loc, err) => {
                 let span = to_span(loc);
-                bail!(span, "failed to process image");
+                bail!(span, "failed to process image ({err})");
             }
             KrillaError::SixteenBitImage(image, _) => {
                 let span = gc.image_to_spans.get(&image).unwrap();
@@ -362,6 +444,42 @@ fn finish(
                     *span, "16 bit images are not supported in this export mode";
                     hint: "convert the image to 8 bit instead"
                 )
+            }
+            KrillaError::Pdf(_, e, loc) => {
+                let span = to_span(loc);
+                match e {
+                    // We already validated in `typst-library` that the page index is valid.
+                    PdfError::InvalidPage(_) => bail!(
+                        span,
+                        "invalid page number for PDF file";
+                        hint: "please report this as a bug"
+                    ),
+                    PdfError::VersionMismatch(v) => {
+                        let pdf_ver = v.as_str();
+                        let config_ver = configuration.version();
+                        let cur_ver = config_ver.as_str();
+                        bail!(span,
+                            "the version of the PDF is too high";
+                            hint: "the current export target is {cur_ver}, while the PDF has version {pdf_ver}";
+                            hint: "raise the export target to {pdf_ver} or higher";
+                            hint: "or preprocess the PDF to convert it to a lower version"
+                        );
+                    }
+                }
+            }
+            KrillaError::DuplicateTagId(_, loc) => {
+                let span = to_span(loc);
+                bail!(span,
+                    "duplicate tag id";
+                    hint: "please report this as a bug"
+                );
+            }
+            KrillaError::UnknownTagId(_, loc) => {
+                let span = to_span(loc);
+                bail!(span,
+                    "unknown tag id";
+                    hint: "please report this as a bug"
+                );
             }
         },
     }
@@ -425,44 +543,53 @@ fn convert_error(
         ),
         ValidationError::ContainsNotDefGlyph(f, loc, text) => error!(
             to_span(*loc),
-            "{prefix} the text '{text}' cannot be displayed using {}",
-            display_font(gc.fonts_backward.get(f).unwrap());
+            "{prefix} the text `{}` could not be displayed with {}",
+            text.repr(),
+            display_font(gc.fonts_backward.get(f));
             hint: "try using a different font"
         ),
-        ValidationError::InvalidCodepointMapping(_, _, cp, loc) => {
-            if let Some(c) = cp.map(|c| eco_format!("{:#06x}", c as u32)) {
-                let msg = if loc.is_some() {
-                    "the PDF contains text with"
-                } else {
-                    "the text contains"
-                };
-                error!(to_span(*loc), "{prefix} {msg} the disallowed codepoint {c}")
+        ValidationError::NoCodepointMapping(_, _, loc) => {
+            let msg = if loc.is_some() {
+                "the text was not mapped to a code point"
             } else {
-                // I think this code path is in theory unreachable,
-                // but just to be safe.
-                let msg = if loc.is_some() {
-                    "the PDF contains text with missing codepoints"
-                } else {
-                    "the text was not mapped to a code point"
-                };
-                error!(
-                    to_span(*loc),
-                    "{prefix} {msg}";
-                    hint: "for complex scripts like Arabic, it might not be \
-                           possible to produce a compliant document"
-                )
-            }
+                "the PDF contains text with missing codepoints"
+            };
+            error!(
+                to_span(*loc),
+                "{prefix} {msg}";
+                hint: "for complex scripts like Arabic, it might not be \
+                       possible to produce a compliant document"
+            )
+        }
+        ValidationError::InvalidCodepointMapping(_, _, c, loc) => {
+            let msg = if loc.is_some() {
+                "the text contains"
+            } else {
+                "the PDF contains text with"
+            };
+            error!(
+                to_span(*loc),
+                "{prefix} {msg} the disallowed codepoint `{}`",
+                c.repr()
+            )
         }
         ValidationError::UnicodePrivateArea(_, _, c, loc) => {
-            let code_point = eco_format!("{:#06x}", *c as u32);
             let msg = if loc.is_some() { "the PDF" } else { "the text" };
             error!(
                 to_span(*loc),
-                "{prefix} {msg} contains the codepoint {code_point}";
+                "{prefix} {msg} contains the codepoint `{}`", c.repr();
                 hint: "codepoints from the Unicode private area are \
-                       forbidden in this export mode"
+                       forbidden in this export mode",
             )
         }
+        ValidationError::RestrictedLicense(f) => error!(
+            Span::detached(),
+            "{prefix} license of {} is too restrictive",
+            display_font(gc.fonts_backward.get(f));
+            hint: "the font has specified \"Restricted License embedding\" in its metadata";
+            hint: "restrictive font licenses are prohibited by {} because they limit the suitability for archival",
+            validator.as_str()
+        ),
         ValidationError::Transparency(loc) => {
             let span = to_span(*loc);
             let hint1 = "try exporting with a different standard that \
@@ -506,19 +633,19 @@ fn convert_error(
             }
         }
         ValidationError::EmbeddedFile(e, s) => {
-            // We always set the span for embedded files, so it cannot be detached.
+            // We always set the span for attached files, so it cannot be detached.
             let span = to_span(*s);
             match e {
                 EmbedError::Existence => {
                     error!(
-                        span, "{prefix} document contains an embedded file";
-                        hint: "embedded files are not supported in this export mode"
+                        span, "{prefix} document contains an attached file";
+                        hint: "file attachments are not supported in this export mode"
                     )
                 }
                 EmbedError::MissingDate => {
                     error!(
                         span, "{prefix} document date is missing";
-                        hint: "the document must have a date when embedding files";
+                        hint: "the document must have a date when attaching files";
                         hint: "`set document(date: none)` must not be used in this case"
                     )
                 }
@@ -532,16 +659,20 @@ fn convert_error(
         }
         // The below errors cannot occur yet, only once Typst supports full PDF/A
         // and PDF/UA. But let's still add a message just to be on the safe side.
-        ValidationError::MissingAnnotationAltText => error!(
-            Span::detached(),
-            "{prefix} missing annotation alt text";
-            hint: "please report this as a bug"
-        ),
-        ValidationError::MissingAltText => error!(
-            Span::detached(),
-            "{prefix} missing alt text";
-            hint: "make sure your images and equations have alt text"
-        ),
+        ValidationError::MissingAnnotationAltText(loc) => {
+            let span = to_span(*loc);
+            error!(
+                span, "{prefix} missing annotation alt text";
+                hint: "please report this as a bug"
+            )
+        }
+        ValidationError::MissingAltText(loc) => {
+            let span = to_span(*loc);
+            error!(
+                span, "{prefix} missing alt text";
+                hint: "make sure your images and equations have alt text"
+            )
+        }
         ValidationError::NoDocumentLanguage => error!(
             Span::detached(),
             "{prefix} missing document language";
@@ -566,35 +697,41 @@ fn convert_error(
         ValidationError::NoDocumentTitle => error!(
             Span::detached(),
             "{prefix} missing document title";
-            hint: "set the title of the document"
+            hint: "set the title with `set document(title: [...])`"
         ),
         ValidationError::MissingDocumentDate => error!(
             Span::detached(),
             "{prefix} missing document date";
             hint: "set the date of the document"
         ),
+        ValidationError::EmbeddedPDF(loc) => {
+            error!(
+                to_span(*loc),
+                "embedding PDFs is currently not supported in this export mode";
+                hint: "try converting the PDF to an SVG before embedding it"
+            )
+        }
     }
 }
 
 /// Convert a krilla location to a span.
-fn to_span(loc: Option<krilla::surface::Location>) -> Span {
-    loc.map(|l| Span::from_raw(NonZeroU64::new(l).unwrap()))
-        .unwrap_or(Span::detached())
+pub(crate) fn to_span(loc: Option<krilla::surface::Location>) -> Span {
+    loc.map(Span::from_raw).unwrap_or(Span::detached())
 }
 
 fn collect_named_destinations(
     document: &PagedDocument,
     pic: &PageIndexConverter,
-) -> HashMap<Location, NamedDestination> {
-    let mut locs_to_names = HashMap::new();
+) -> FxHashMap<Location, NamedDestination> {
+    let mut locs_to_names = FxHashMap::default();
 
     // Find all headings that have a label and are the first among other
     // headings with the same label.
     let matches: Vec<_> = {
-        let mut seen = HashSet::new();
+        let mut seen = FxHashSet::default();
         document
             .introspector
-            .query(&HeadingElem::elem().select())
+            .query(&HeadingElem::ELEM.select())
             .iter()
             .filter_map(|elem| elem.location().zip(elem.label()))
             .filter(|&(_, label)| seen.insert(label))
@@ -602,22 +739,10 @@ fn collect_named_destinations(
     };
 
     for (loc, label) in matches {
-        let pos = document.introspector.position(loc);
-        let index = pos.page.get() - 1;
-        // We are subtracting 10 because the position of links e.g. to headings is always at the
-        // baseline and if you link directly to it, the text will not be visible
-        // because it is right above.
-        let y = (pos.point.y - Abs::pt(10.0)).max(Abs::zero());
-
         // Only add named destination if page belonging to the position is exported.
-        if let Some(index) = pic.pdf_page_index(index) {
-            let named = NamedDestination::new(
-                label.resolve().to_string(),
-                XyzDestination::new(
-                    index,
-                    krilla::geom::Point::from_xy(pos.point.x.to_f32(), y.to_f32()),
-                ),
-            );
+        let pos = document.introspector.position(loc);
+        if let Some(dest) = crate::link::pos_to_xyz(pic, pos) {
+            let named = NamedDestination::new(label.resolve().to_string(), dest);
             locs_to_names.insert(loc, named);
         }
     }
@@ -626,13 +751,13 @@ fn collect_named_destinations(
 }
 
 pub(crate) struct PageIndexConverter {
-    page_indices: HashMap<usize, usize>,
+    page_indices: FxHashMap<usize, usize>,
     skipped_pages: usize,
 }
 
 impl PageIndexConverter {
     pub fn new(document: &PagedDocument, options: &PdfOptions) -> Self {
-        let mut page_indices = HashMap::new();
+        let mut page_indices = FxHashMap::default();
         let mut skipped_pages = 0;
 
         for i in 0..document.pages.len() {

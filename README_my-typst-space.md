@@ -9,6 +9,13 @@ docker build -t okatsn/my-typst-space:latest .
 docker push okatsn/my-typst-space:latest
 ```
 
+or
+
+```bash
+# cd my-typst-space
+. docker_build_and_push.sh latest
+```
+
 Noted that, there is a `lefthook.yml`. You can stage the modified Dockerfile and run `lefthook run pre-commit` manually, which executes `docker_build_and_push.sh`. (`lefthook install` is required)
 
 ## Use the image `okatsn/my-typst-space`
